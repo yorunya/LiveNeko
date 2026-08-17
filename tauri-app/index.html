@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LiveNeko</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header class="topbar">
+        <div class="brand">
+          <h1>LiveNeko</h1>
+        </div>
+        <nav class="tabs">
+          <button class="tab active" data-tab="pipeline" data-i18n="tab.pipeline">Pipeline</button>
+          <button class="tab" data-tab="results" data-i18n="tab.results">Results</button>
+          <button class="tab" data-tab="settings" data-i18n="tab.settings">Settings</button>
+        </nav>
+        <div class="topbar-right">
+          <button id="btn-run" class="btn success" data-i18n="btn.start">Start Analysis</button>
+        </div>
+      </header>
+
+      <main>
+        <!-- Pipeline view -->
+        <section id="tab-pipeline" class="view active">
+          <div class="card">
+            <h2 data-i18n="pipeline.addTitle">Add videos to the queue</h2>
+            <div class="row">
+              <input id="url-input" type="text" data-i18n-placeholder="pipeline.urlPlaceholder" placeholder="Bilibili video URL (e.g. https://www.bilibili.com/video/BV…)" />
+              <button id="btn-add-url" class="btn primary" data-i18n="pipeline.addUrl">Add URL</button>
+              <button id="btn-add-file" class="btn" data-i18n="pipeline.addLocal">Add local video</button>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-head">
+              <h2 data-i18n="pipeline.queue">Queue</h2>
+              <button id="btn-clear" class="btn ghost small" data-i18n="pipeline.clear">Clear</button>
+            </div>
+            <div id="queue-list" class="queue-list">
+              <div class="empty" data-i18n="pipeline.queueEmpty">Queue is empty. Add a URL or local video above.</div>
+            </div>
+          </div>
+
+          <div class="card">
+            <h2 data-i18n="pipeline.log">Log</h2>
+            <div id="log-area" class="log-area"></div>
+          </div>
+        </section>
+
+        <!-- Results view -->
+        <section id="tab-results" class="view">
+          <div class="results-search-bar">
+            <input id="results-search" type="text" data-i18n-placeholder="results.searchPlaceholder" placeholder="Search titles & contents (regex supported)" />
+            <label class="inline" style="flex-shrink:0;"><input type="checkbox" id="results-regex" /> <span data-i18n="results.regex">regex</span></label>
+            <button id="btn-results-search" class="btn small" data-i18n="results.search">Search</button>
+            <button id="btn-results-clear" class="btn ghost small" data-i18n="results.clear">Clear</button>
+            <span id="results-search-status" class="hint"></span>
+          </div>
+          <div class="results-layout">
+            <div class="results-list card">
+              <div class="results-list-head">
+                <h2 data-i18n="results.summaries">Summaries</h2>
+              </div>
+              <div id="results-list" class="results-list-scroll"></div>
+            </div>
+            <div class="results-detail card">
+              <div id="results-detail" class="results-detail-scroll">
+                <div class="empty" data-i18n="results.selectHint">Select a summary on the left.</div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Settings view -->
+        <section id="tab-settings" class="view">
+          <div class="card">
+            <h2 data-i18n="settings.languageTitle">Language</h2>
+            <p class="hint" data-i18n="settings.languageHint">Interface language. Default follows your system language.</p>
+            <div class="row">
+              <select id="cfg-language" style="flex:0 1 240px;">
+                <option value="" data-i18n="settings.languageSystem">System default</option>
+                <option value="en">English</option>
+                <option value="zh">中文</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="card">
+            <h2 data-i18n="settings.envTitle">Environment Check</h2>
+            <div id="env-status" class="env-status"></div>
+            <button id="btn-recheck" class="btn small" data-i18n="settings.recheck">Re-check environment</button>
+          </div>
+
+          <div class="card">
+            <h2 data-i18n="settings.videonekoTitle">VideoNeko Model (visual)</h2>
+            <p class="hint" data-i18n="settings.videonekoHint">Your fine-tuned ViT model weights directory (must contain config.json, model.safetensors, preprocessor_config.json).</p>
+            <div class="row">
+              <input id="cfg-videoneko" type="text" data-i18n-placeholder="settings.videonekoPlaceholder" placeholder="Path to VideoNeko model directory" />
+              <button id="btn-browse-videoneko" class="btn" data-i18n="settings.browse">Browse…</button>
+            </div>
+          </div>
+
+          <div class="card">
+            <h2 data-i18n="settings.qualityTitle">Video download quality</h2>
+            <p class="hint" data-i18n="settings.qualityHint">Resolution used when downloading a video from a Bilibili URL (360P / 480P / 720P / 1080P). Lower is faster and smaller; default is 720P.</p>
+            <div class="row">
+              <label><input type="radio" name="quality" value="360" /> 360P</label>
+              <label><input type="radio" name="quality" value="480" /> 480P</label>
+              <label><input type="radio" name="quality" value="720" /> 720P</label>
+              <label><input type="radio" name="quality" value="1080" /> 1080P</label>
+            </div>
+          </div>
+
+          <div class="card">
+            <h2 data-i18n="settings.engineTitle">Summarization Engine</h2>
+            <p class="hint" data-i18n="settings.engineHint">Choose where the summary LLM runs: a hosted OpenAI-compatible API, a local Ollama server, or a llama.cpp server.</p>
+            <div class="row">
+              <label><input type="radio" name="engine" value="api" /> <span data-i18n="settings.engineApi">OpenAI-compatible API</span></label>
+              <label><input type="radio" name="engine" value="ollama" /> <span data-i18n="settings.engineOllama">Ollama</span></label>
+              <label><input type="radio" name="engine" value="llamacpp" /> <span data-i18n="settings.engineLlamacpp">llama.cpp server</span></label>
+            </div>
+
+            <div id="api-settings" class="sub-card">
+              <h3 data-i18n="settings.engineApi">OpenAI-compatible API</h3>
+              <div class="row"><label class="wide"><span data-i18n="settings.baseUrl">Base URL</span> <input id="cfg-api-base" type="text" placeholder="https://api.openai.com/v1" /></label></div>
+              <div class="row"><label class="wide"><span data-i18n="settings.apiKey">API Key</span> <input id="cfg-api-key" type="password" placeholder="sk-…" /></label></div>
+              <div class="row"><label class="wide"><span data-i18n="settings.model">Model</span> <input id="cfg-api-model" type="text" placeholder="gpt-4o" /></label></div>
+              <div class="row">
+                <label class="inline"><input type="checkbox" id="cfg-api-thinking" /> <span data-i18n="settings.thinking">Thinking</span></label>
+                <label class="inline"><span data-i18n="settings.maxTokens">Max tokens</span> <input id="cfg-api-max-tokens" type="number" min="256" step="256" /></label>
+                <label class="inline"><span data-i18n="settings.temperature">Temperature</span> <input id="cfg-api-temperature" min="0" max="2" step="0.1" type="number" style="width:90px" /></label>
+                <label class="inline"><span data-i18n="settings.topP">Top-p</span> <input id="cfg-api-top-p" min="0" max="1" step="0.05" type="number" style="width:90px" /></label>
+              </div>
+              <div class="row"><button id="btn-test-api" class="btn small" data-i18n="settings.testConnection">Test connection</button><span id="api-test-status" class="hint"></span></div>
+            </div>
+
+            <div id="ollama-settings" class="sub-card hidden">
+              <h3 data-i18n="settings.engineOllama">Ollama</h3>
+              <div class="row"><label class="wide"><span data-i18n="settings.baseUrl">Base URL</span> <input id="cfg-ollama-base" type="text" placeholder="http://localhost:11434/v1" /></label></div>
+              <div class="row"><label class="wide"><span data-i18n="settings.model">Model</span> <input id="cfg-ollama-model" type="text" placeholder="qwen3:8b" /></label></div>
+              <div class="row">
+                <label class="inline"><input type="checkbox" id="cfg-ollama-thinking" /> <span data-i18n="settings.thinking">Thinking</span></label>
+              </div>
+              <div class="row"><button id="btn-test-ollama" class="btn small" data-i18n="settings.testConnection">Test connection</button><span id="ollama-test-status" class="hint"></span></div>
+            </div>
+
+            <div id="llamacpp-settings" class="sub-card hidden">
+              <h3 data-i18n="settings.engineLlamacpp">llama.cpp server</h3>
+              <div class="row"><label class="wide"><span data-i18n="settings.baseUrl">Base URL</span> <input id="cfg-llamacpp-base" type="text" placeholder="http://localhost:8080/v1" /></label></div>
+              <div class="row"><label class="wide"><span data-i18n="settings.model">Model</span> <input id="cfg-llamacpp-model" type="text" placeholder="Model name or GGUF path" /></label></div>
+              <div class="row">
+                <label class="inline"><input type="checkbox" id="cfg-llamacpp-thinking" /> <span data-i18n="settings.thinking">Thinking</span></label>
+              </div>
+              <div class="row"><button id="btn-test-llamacpp" class="btn small" data-i18n="settings.testConnection">Test connection</button><span id="llamacpp-test-status" class="hint"></span></div>
+            </div>
+          </div>
+
+          <div class="card">
+            <h2 data-i18n="settings.promptTitle">Summary prompt</h2>
+            <p class="hint" data-i18n="settings.promptHint">System prompt sent to the summarization model. Edit freely; it is stored locally. Empty → reset to the bundled default.</p>
+            <textarea id="cfg-prompt" rows="14" spellcheck="false" style="width:100%;font-family:Consolas,monospace;font-size:12px;background:var(--card2);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:10px;"></textarea>
+            <div class="row">
+              <button id="btn-reset-prompt" class="btn ghost small" data-i18n="settings.resetPrompt">Reset to default</button>
+            </div>
+          </div>
+
+          <div class="row right">
+            <button id="btn-save-settings" class="btn primary" data-i18n="settings.save">Save</button>
+            <span id="save-status" class="hint"></span>
+          </div>
+        </section>
+      </main>
+
+      <footer class="statusbar">
+        <span id="status-text" data-i18n="status.ready">Ready.</span>
+        <span id="model-status" class="hint"></span>
+      </footer>
+
+      <!-- First-launch setup wizard -->
+      <div id="setup-modal" class="modal-overlay hidden">
+        <div class="modal">
+          <h2 data-i18n="setup.welcome">Welcome to LiveNeko 👋</h2>
+          <p class="hint" data-i18n="setup.hint">Let's get everything configured. Complete the steps below — the pipeline needs your VideoNeko model and a summarization engine.</p>
+          <div class="setup-steps">
+            <div class="setup-step">
+              <span class="step-num">1</span>
+              <div class="step-body">
+                <strong data-i18n="setup.step1">Select your VideoNeko model weights</strong>
+                <p class="hint" data-i18n="setup.step1Hint">Browse for the directory containing your fine-tuned ViT weights (config.json, model.safetensors, preprocessor_config.json).</p>
+                <div class="row">
+                  <input id="setup-videoneko" type="text" data-i18n-placeholder="setup.videonekoPlaceholder" placeholder="Path to VideoNeko model directory" />
+                  <button id="setup-browse-videoneko" class="btn" data-i18n="settings.browse">Browse…</button>
+                </div>
+              </div>
+            </div>
+            <div class="setup-step">
+              <span class="step-num">2</span>
+              <div class="step-body">
+                <strong data-i18n="setup.step2">Choose a summarization engine</strong>
+                <p class="hint" data-i18n="setup.step2Hint">Select where the summary LLM runs: a hosted OpenAI-compatible API, a local Ollama server, or a llama.cpp server.</p>
+                <div class="row">
+                  <label><input type="radio" name="setup-engine" value="api" /> <span data-i18n="setup.engineApi">OpenAI API</span></label>
+                  <label><input type="radio" name="setup-engine" value="ollama" /> <span data-i18n="setup.engineOllama">Ollama</span></label>
+                  <label><input type="radio" name="setup-engine" value="llamacpp" /> <span data-i18n="setup.engineLlamacpp">llama.cpp</span></label>
+                </div>
+                <div class="row" id="setup-api-row" style="flex-direction:column;align-items:stretch;">
+                  <input id="setup-api-base" type="text" data-i18n-placeholder="setup.apiBase" placeholder="API Base URL (e.g. https://api.openai.com/v1)" />
+                  <input id="setup-api-key" type="password" data-i18n-placeholder="setup.apiKey" placeholder="API Key (optional)" />
+                  <input id="setup-api-model" type="text" data-i18n-placeholder="setup.apiModel" placeholder="API Model name (e.g. gpt-4o)" />
+                </div>
+                <div class="row" id="setup-ollama-row" style="flex-direction:column;align-items:stretch;display:none;">
+                  <input id="setup-ollama-base" type="text" data-i18n-placeholder="setup.ollamaBase" placeholder="Ollama Base URL (e.g. http://localhost:11434/v1)" />
+                  <input id="setup-ollama-model" type="text" data-i18n-placeholder="setup.ollamaModel" placeholder="Ollama model (e.g. qwen3:8b)" />
+                </div>
+                <div class="row" id="setup-llamacpp-row" style="flex-direction:column;align-items:stretch;display:none;">
+                  <input id="setup-llamacpp-base" type="text" data-i18n-placeholder="setup.llamacppBase" placeholder="llama.cpp Base URL (e.g. http://localhost:8080/v1)" />
+                  <input id="setup-llamacpp-model" type="text" data-i18n-placeholder="setup.llamacppModel" placeholder="Model name or GGUF path" />
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="row right">
+            <button id="setup-skip" class="btn ghost" data-i18n="setup.skip">Skip for now</button>
+            <button id="setup-finish" class="btn success" data-i18n="setup.finish">Finish Setup</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

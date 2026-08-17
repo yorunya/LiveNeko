@@ -27,6 +27,6 @@ npm run tauri build
 
 ## 微调模型
 
-基础模型是 `google/vit-base-patch16-224`，您可以从 Hugging Face 下载并用作默认模型，或者自行进行微调。这里有一个使用 `sample.py` 和 `train.py` 的示例。您可以从 `model/` 目录下载我为虚拟主播 `Ace Taffy` 编写的简单 FineFune 模型。
+基础模型是 `google/vit-base-patch16-224`，您可以从 Hugging Face 下载并用作默认模型，或者自行进行微调。这里有一个使用 `sample.py` 和 `train.py` 的示例。您可以从 `model/` 目录下载我为虚拟主播 `永雏塔菲` 编写的简单 FineFune 模型。
 
-此外，`spk/` 目录提供了 `Ace Taffy` 的声纹。
+此外，`spk/` 目录提供了 `永雏塔菲` 的声纹。

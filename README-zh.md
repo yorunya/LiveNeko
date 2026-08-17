@@ -24,6 +24,7 @@ pip install torchvision transformers numpy soundfile funasr df
 git clone https://huggingface.co/FunAudioLLM/SenseVoiceSmall ./model/SenseVoiceSmall
 git clone https://huggingface.co/iic/speech_fsmn_vad_zh-cn-16k-common-default ./model/fsmn-vad
 git clone https://huggingface.co/iic/speech_campplus_sv_zh-cn_16k-common ./model/cam++
+curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe -o yt-dlp.exe
 ```
 
 ```bash

@@ -28,7 +28,7 @@ import torch
 import torchaudio
 from funasr import AutoModel
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
 SPK_LABEL = "taffy"

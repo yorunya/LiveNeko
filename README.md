@@ -16,11 +16,11 @@ For windows, install python and ffmpeg is needed:
 winget install Gyan.FFmpeg
 winget install Python.Python.3.12
 ```
+
 The following python libs are requires:
 ```bash
-pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-
-pip install torchvision transformers numpy soundfile funasr df
+pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+pip install transformers numpy soundfile funasr
 ```
  
 Download a release or build it yourself, git clone current repo then run:
@@ -30,6 +30,8 @@ git clone https://huggingface.co/iic/speech_fsmn_vad_zh-cn-16k-common-default ./
 git clone https://huggingface.co/iic/speech_campplus_sv_zh-cn_16k-common ./model/cam++
 curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe -o yt-dlp.exe
 ```
+
+You may need to substitude the libDF with the files in `./diff`
 
 ```bash
 cd tauri-app

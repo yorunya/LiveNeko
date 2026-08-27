@@ -41,7 +41,7 @@
       "../../model/SenseVoiceSmall": "model/SenseVoiceSmall",
       "../../model/fsmn-vad": "model/fsmn-vad",
       "../../model/cam++": "model/cam++",
-      "../../model/DeepFilterNet3": "model/DeepFilterNet3",
+      "../../DeepFilterNet/models/DeepFilterNet3_onnx.tar.gz": "model/DeepFilterNet3_onnx.tar.gz",
       "../scripts": "scripts"
     }
   }

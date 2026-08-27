@@ -8,7 +8,7 @@ pub struct Assets {
     pub prompt_md: PathBuf,
     pub scripts_dir: PathBuf,
     pub audio_model_dir: PathBuf,
-    pub filter_model_dir: PathBuf,
+    pub filter_model_tar: PathBuf,
     pub spk_dir: PathBuf,
 }
 
@@ -43,12 +43,27 @@ impl Assets {
             res
         };
 
+        // The ONNX DeepFilterNet model is bundled as model/DeepFilterNet3_onnx.tar.gz
+        // but lives under DeepFilterNet/models/ in the source repo.
+        let filter_model_tar = {
+            let candidates = [
+                resource.join("model/DeepFilterNet3_onnx.tar.gz"),
+                repo_root.join("model/DeepFilterNet3_onnx.tar.gz"),
+                repo_root.join("DeepFilterNet/models/DeepFilterNet3_onnx.tar.gz"),
+            ];
+            candidates
+                .iter()
+                .find(|p| p.exists())
+                .cloned()
+                .unwrap_or_else(|| candidates[0].clone())
+        };
+
         Self {
             yt_dlp_exe: pick("yt-dlp.exe"),
             prompt_md: pick("prompt.md"),
             scripts_dir: pick("scripts"),
             audio_model_dir: pick("model"),
-            filter_model_dir: pick("model/DeepFilterNet3"),
+            filter_model_tar,
             spk_dir: pick("spk"),
         }
     }
@@ -60,7 +75,7 @@ impl Assets {
     }
 
     pub fn filter_model_present(&self) -> bool {
-        self.filter_model_dir.join("config.ini").exists()
+        self.filter_model_tar.exists()
     }
 
     pub fn spk_refs(&self) -> Vec<PathBuf> {

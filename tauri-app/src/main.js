@@ -3,6 +3,55 @@ import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { marked } from "marked";
 
+// ---------- OS theme ----------
+// The Rust backend detects the OS theme and accent color once at startup
+// (official Tauri window API + official platform methods); we fetch them once
+// here and apply them. `data-theme` selects color-scheme (and the scheme-tuned
+// tokens in styles.css), the accent is injected as --os-accent, and readable
+// text on it as --os-on-accent — every other color is derived in CSS from
+// system color keywords. The app always follows the OS theme: no custom theme
+// option, and no runtime theme-change listener is registered.
+async function applyOsTheme() {
+  let info = null;
+  try {
+    info = await invoke("get_os_theme");
+  } catch { /* keep the system-keyword fallbacks from :root */ }
+  const theme = info?.theme === "light" ? "light" : "dark";
+  document.documentElement.dataset.theme = theme;
+  document.documentElement.style.colorScheme = theme; // native scrollbars/controls
+  if (info?.accent) {
+    const root = document.documentElement;
+    root.style.setProperty("--os-accent", info.accent);
+    const onAccent = contrastColor(info.accent, theme);
+    if (onAccent) root.style.setProperty("--os-on-accent", onAccent);
+  }
+}
+
+// Resolve a CSS system color keyword (Canvas, CanvasText, ...) to its rgb value.
+function systemColor(keyword) {
+  const probe = document.createElement("span");
+  probe.style.color = keyword;
+  document.body.appendChild(probe);
+  const color = getComputedStyle(probe).color;
+  probe.remove();
+  return color;
+}
+
+// Readable text on top of the OS accent: pick the light or dark pole of the
+// OS theme's own canvas colors according to the accent's relative luminance.
+// (Canvas is the light pole in a light scheme and the dark pole in a dark one;
+// CanvasText is its opposite, so no fixed contrast colors are needed.)
+function contrastColor(hex, theme) {
+  const r = parseInt(hex.slice(1, 3), 16);
+  const g = parseInt(hex.slice(3, 5), 16);
+  const b = parseInt(hex.slice(5, 7), 16);
+  if ([r, g, b].some(Number.isNaN)) return null;
+  const luminance = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+  const darkPole = theme === "light" ? "CanvasText" : "Canvas";
+  const lightPole = theme === "light" ? "Canvas" : "CanvasText";
+  return luminance > 0.55 ? systemColor(darkPole) : systemColor(lightPole);
+}
+
 // ---------- global state ----------
 const state = {
   config: null,
@@ -644,7 +693,7 @@ async function openResult(stem) {
       </div>
       <span id="resummarize-status" class="hint"></span>
       <div class="markdown-body">${summaryHtml}</div>
-      <pre id="detail-raw" class="hidden" style="margin-top:10px;background:#0a1122;padding:10px;border-radius:6px;overflow:auto;max-height:400px;"></pre>`;
+      <pre id="detail-raw" class="hidden" style="margin-top:10px;background:var(--code-bg);padding:10px;border-radius:6px;overflow:auto;max-height:400px;"></pre>`;
     $("#btn-copy").addEventListener("click", async () => {
       await navigator.clipboard.writeText(r.summary);
       $("#btn-copy").textContent = t("results.copied");
@@ -998,6 +1047,7 @@ function init() {
 }
 
 (async function main() {
+  await applyOsTheme();
   init();
   applyLanguage();
   await wireEvents();

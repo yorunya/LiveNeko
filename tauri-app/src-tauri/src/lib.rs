@@ -1,7 +1,9 @@
 mod assets;
 mod commands;
 mod config;
+mod df_denoise;
 mod model_ipc;
+mod os_theme;
 mod pipeline;
 
 use std::path::PathBuf;
@@ -16,12 +18,19 @@ pub fn run() {
                 .app_data_dir()
                 .unwrap_or_else(|_| PathBuf::from("."));
             std::fs::create_dir_all(&app_data_dir).ok();
-            app.manage(commands::AppState::new(app_data_dir));
+            // Detect the OS theme + accent color exactly once, here at startup,
+            // via the official Tauri API and platform methods (see os_theme.rs).
+            // No theme-change listener is registered anywhere; the app keeps
+            // these initial values for its whole lifetime.
+            let os_theme = os_theme::detect_theme(app).to_string();
+            let os_accent = os_theme::detect_accent_color();
+            app.manage(commands::AppState::new(app_data_dir, os_theme, os_accent));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             commands::check_environment,
             commands::get_config,
+            commands::get_os_theme,
             commands::save_config,
             commands::get_prompt,
             commands::reset_prompt,

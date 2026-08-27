@@ -16,10 +16,17 @@ pub struct AppState {
     /// Legacy-result migration is idempotent; run it once per process.
     pub migrated: AtomicBool,
     pub app_data_dir: PathBuf,
+    /// OS appearance ("light" | "dark"), detected once at startup via the official
+    /// Tauri window API (which uses the platform methods: Windows apps theme,
+    /// macOS NSAppearance, Linux GTK/freedesktop). Never re-polled afterwards.
+    pub os_theme: String,
+    /// OS accent color as "#rrggbb" where the OS exposes it (Windows DWM
+    /// registry, GNOME gsettings, macOS defaults), detected once at startup.
+    pub os_accent: Option<String>,
 }
 
 impl AppState {
-    pub fn new(app_data_dir: PathBuf) -> Self {
+    pub fn new(app_data_dir: PathBuf, os_theme: String, os_accent: Option<String>) -> Self {
         Self {
             config: Mutex::new(AppConfig::load(&app_data_dir)),
             queue: Mutex::new(Vec::new()),
@@ -27,6 +34,8 @@ impl AppState {
             running: AtomicBool::new(false),
             migrated: AtomicBool::new(false),
             app_data_dir,
+            os_theme,
+            os_accent,
         }
     }
 }
@@ -51,8 +60,8 @@ fn ensure_assets(app: &AppHandle) -> Result<Assets, String> {
     }
     if !assets.filter_model_present() {
         return Err(format!(
-            "DeepFilterNet model missing under {}",
-            assets.filter_model_dir.display()
+            "DeepFilterNet model missing at {}",
+            assets.filter_model_tar.display()
         ));
     }
     if assets.spk_refs().is_empty() {
@@ -174,6 +183,24 @@ fn run_capture_cwd(
 #[tauri::command]
 pub fn get_config(state: State<'_, AppState>) -> AppConfig {
     state.config.lock().unwrap().clone()
+}
+
+/// OS appearance captured once at startup. The app always follows the OS theme;
+/// there is intentionally no custom/user-selectable theme option.
+#[derive(serde::Serialize)]
+pub struct OsThemeInfo {
+    /// "light" | "dark"
+    pub theme: String,
+    /// OS accent color as "#rrggbb", when the platform exposes one.
+    pub accent: Option<String>,
+}
+
+#[tauri::command]
+pub fn get_os_theme(state: State<'_, AppState>) -> OsThemeInfo {
+    OsThemeInfo {
+        theme: state.os_theme.clone(),
+        accent: state.os_accent.clone(),
+    }
 }
 
 #[tauri::command]

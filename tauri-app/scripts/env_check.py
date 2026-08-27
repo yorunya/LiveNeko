@@ -13,7 +13,6 @@ REQUIRED_LIBS = [
     "numpy",
     "soundfile",
     "funasr",
-    "df",
 ]
 
 

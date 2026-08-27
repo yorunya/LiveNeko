@@ -1,17 +1,21 @@
 """Resident IPC audio worker for the LiveNeko Tauri app.
 
 Launched once by the Rust backend at the start of a pipeline run. Loads the
-DeepFilterNet (denoise), VAD, ASR and speaker models a single time, then stays alive reading JSON requests on stdin and writing JSON responses on stdout until told to shut down. Models are NOT reloaded between requests.
+VAD, ASR and speaker models a single time, then stays alive reading JSON
+requests on stdin and writing JSON responses on stdout until told to shut down.
+Models are NOT reloaded between requests.
 
-The `process` command runs the whole audio chain in one request: denoise the raw 48 kHz wav -> downsample to 16 kHz in-memory -> VAD -> ASR -> speaker labelling, returning raw utterances. This worker does ONLY model inference; the Rust backend owns ffmpeg extraction, text parsing, formatting, and result-file writing.
+The `process` command expects an already-denoised 16 kHz mono WAV. DeepFilterNet
+noise suppression now runs in-process in Rust (tauri-app/src-tauri/src/df_denoise.rs)
+using the ONNX `df` crate, so this worker only performs VAD/ASR/SPK.
 
 Protocol (newline-delimited JSON on stdin/stdout):
-  Request:  {"cmd":"process","id":"<id>","input":"<raw 48khz.wav>"}
+  Request:  {"cmd":"process","id":"<id>","input":"<filtered 16khz.wav>"}
   Response: {"cmd":"process","id":"<id>","ok":true,
              "utterances":[[start_ms,end_ms,"taffy"|"other","<raw tagged text>"], ...]}
             {"cmd":"process","id":"<id>","ok":false,"error":"..."}
   Shutdown: {"cmd":"shutdown"}
-Progress is emitted on stdout as {"progress":N} lines: 0..20 for the denoise phase, 20..100 for the ASR phase.
+Progress is emitted on stdout as {"progress":N} lines: 0..100 for the ASR phase.
 """
 import argparse
 import concurrent.futures
@@ -25,7 +29,6 @@ import sys
 import numpy as np
 import soundfile as sf
 import torch
-import torchaudio
 from funasr import AutoModel
 
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
@@ -43,9 +46,6 @@ ASR_BATCH_SIZE_S = 300
 SPK_MIN_SAMPLES = int(SPK_MIN_S * SAMPLE_RATE)
 SPK_CHUNK_SAMPLES = int(SPK_CHUNK_S * SAMPLE_RATE)
 
-# Denoise in CHUNK_S-second pieces to keep VRAM flat.
-CHUNK_S = 32
-
 
 def send(obj):
     sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
@@ -54,7 +54,7 @@ def send(obj):
 
 @contextlib.contextmanager
 def quiet_stdout():
-    """Redirect stray prints (df/funasr banners) to stderr so stdout stays a
+    """Redirect stray prints (funasr banners) to stderr so stdout stays a
     clean JSON channel for IPC."""
     real_stdout = sys.stdout
     sys.stdout = sys.stderr
@@ -64,50 +64,13 @@ def quiet_stdout():
         sys.stdout = real_stdout
 
 
-# ---- denoise (DeepFilterNet) ----
-
-
-def enhance_chunked(model, df_state, audio, on_progress=None):
-    sr = df_state.sr()
-    total = audio.shape[-1]
-    chunk = int(sr * CHUNK_S)
-    out = torch.zeros_like(audio)
-    n = max(1, (total + chunk - 1) // chunk)
-    for i in range(0, total, chunk):
-        seg = audio[:, i: i + chunk]
-        with torch.no_grad():
-            out[:, i: i + chunk] = enhance(model, df_state, seg, atten_lim_db=18.0)
-        if n > 1 and on_progress:
-            on_progress(min(100, int((i + chunk) / total * 100)))
-    return out
-
-
-def filter_downsample(in_path, model, df_state, on_progress=None):
-    """Denoise a raw 48 kHz wav and return a 16 kHz float32 numpy array."""
-    audio, _ = load_audio(in_path, sr=df_state.sr())
-    if not torch.is_tensor(audio):
-        audio = torch.from_numpy(np.asarray(audio, dtype=np.float32))
-    audio = audio.cpu()
-    if audio.ndim == 1:
-        audio = audio.unsqueeze(0)
-    enhanced = enhance_chunked(model, df_state, audio, on_progress)
-    enhanced = enhanced.squeeze(0).detach()
-    src_sr = df_state.sr()
-    if src_sr != SAMPLE_RATE:
-        if torch.cuda.is_available():
-            enhanced = torchaudio.functional.resample(enhanced.cuda(), src_sr, SAMPLE_RATE).cpu()
-        else:
-            enhanced = torchaudio.functional.resample(enhanced, src_sr, SAMPLE_RATE)
-    return enhanced.numpy()
-
-
 # ---- VAD / ASR / speaker ----
 
 
 def load_speech(wav_path, vad_model):
     speech, sr = sf.read(wav_path, dtype="float32")
     if sr != SAMPLE_RATE:
-        raise RuntimeError(f"Unexpected sample rate {sr} for {wav_path}")
+        raise RuntimeError(f"Unexpected sample rate {sr} for {wav_path}; expected {SAMPLE_RATE}")
     segments = vad_model.generate(input=speech, fs=SAMPLE_RATE)[0]["value"]
     return speech, segments
 
@@ -194,7 +157,7 @@ def transcribe_samples(speech, segments, asr_model, spk_model, ref_matrix, on_pr
     return utterances
 
 
-def process(req, model, df_state, vad_model, asr_model, spk_model, ref_matrix):
+def process(req, vad_model, asr_model, spk_model, ref_matrix):
     rid = req.get("id", "")
     input_wav = req.get("input", "")
     if not input_wav:
@@ -204,15 +167,13 @@ def process(req, model, df_state, vad_model, asr_model, spk_model, ref_matrix):
         def progress(n):
             send({"progress": int(n)})
 
-        # Denoise + downsample: report 0..20%.
-        speech = filter_downsample(input_wav, model, df_state,
-                                   on_progress=lambda p: progress(p * 0.20))
-        # VAD on the in-memory 16 kHz audio.
-        segments = vad_model.generate(input=speech, fs=SAMPLE_RATE)[0]["value"]
-        # ASR + speaker labelling: report 20..100%.
+        # VAD on the 16 kHz filtered audio.
+        speech, segments = load_speech(input_wav, vad_model)
+        # ASR + speaker labelling: report 20..100 so the Rust backend keeps the
+        # 0..20 range for DeepFilterNet denoising.
         utterances = transcribe_samples(
             speech, segments, asr_model, spk_model, ref_matrix,
-            on_progress=lambda p: progress(20 + p * 0.80),
+            on_progress=lambda p: progress(20 + p * 0.8),
         )
         send({"cmd": "process", "id": rid, "ok": True, "utterances": utterances})
     except Exception as e:
@@ -226,8 +187,6 @@ def main():
                     help="dir containing SenseVoiceSmall/fsmn-vad/cam++")
     ap.add_argument("--ref-dir", required=True,
                     help="dir with pre-resampled 16 kHz reference wav files")
-    ap.add_argument("--filter-model-dir", required=True,
-                    help="dir containing the DeepFilterNet3 model")
     args = ap.parse_args()
 
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -236,21 +195,6 @@ def main():
     log.info("Loading models...")
     try:
         with quiet_stdout():
-            from df.enhance import enhance, init_df, load_audio
-            model, df_state, _ = init_df(
-                args.filter_model_dir,
-                post_filter=False,
-                log_level="ERROR",
-                log_file=None,
-                config_allow_defaults=True,
-                epoch="best",
-            )
-            if torch.cuda.is_available():
-                model = model.to("cuda")
-            model.eval()
-            globals()["load_audio"] = load_audio
-            globals()["enhance"] = enhance
-
             vad_model = AutoModel(model=os.path.join(args.model_dir, "fsmn-vad"),
                                   device=device, disable_update=True, disable_pbar=True)
             asr_model = AutoModel(model=os.path.join(args.model_dir, "SenseVoiceSmall"),
@@ -291,7 +235,7 @@ def main():
             log.info("shutdown")
             break
         elif cmd == "process":
-            process(req, model, df_state, vad_model, asr_model, spk_model, ref_matrix)
+            process(req, vad_model, asr_model, spk_model, ref_matrix)
         else:
             send({"cmd": cmd, "id": req.get("id", ""), "ok": False,
                   "error": f"unknown cmd {cmd}"})

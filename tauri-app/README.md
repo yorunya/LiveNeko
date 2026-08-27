@@ -8,7 +8,7 @@ settings.
 ## Requirements
 - Windows 10/11 with WebView2 (built-in on Win11).
 - System Python (3.10+) with CUDA-enabled `torch`, `torchaudio`, `torchvision`,
-  `transformers`, `numpy`, `soundfile`, `funasr`, and DeepFilterNet (`df`).
+  `transformers`, `numpy`, `soundfile`, and `funasr`.
 - `ffmpeg` on `PATH`.
 - No Python or Git Bash is bundled — the app shells out to the system Python.
 - Summarization runs in-process via `openai-rust2` against one of:
@@ -16,10 +16,10 @@ settings.
   server. No `llama-cpp-python` / `openai` Python packages are needed.
 
 ## Bundled (in the installer)
-- `yt-dlp.exe` and the DeepFilterNet3 model (audio denoising via CUDA Python).
-- VAD/ASR/SPK model weights (`model/SenseVoiceSmall`, `model/fsmn-vad`,
-  `model/cam++`), speaker references (`spk/`), `prompt.md`, and the Python
-  worker scripts (`scripts/`).
+- `yt-dlp.exe`, the DeepFilterNet3 ONNX model (`model/DeepFilterNet3_onnx.tar.gz`
+  for in-process Rust denoising), VAD/ASR/SPK model weights (`model/SenseVoiceSmall`,
+  `model/fsmn-vad`, `model/cam++`), speaker references (`spk/`), `prompt.md`, and
+  the Python worker scripts (`scripts/`).
 
 ## How to run (dev)
 ```bash
@@ -61,9 +61,9 @@ per-video reload).
    download resolution is set in Settings (360P / 480P / 720P / 1080P, default
    720P); the matching `-f "bestvideo[height<=N]+bestaudio/best[height<=N]"`
    selector is passed to yt-dlp.
-2. `2/4 ASR` — ffmpeg extracts 48 kHz mono; the resident `audio_server.py`
-   denoises with DeepFilterNet (CUDA), downsamples to 16 kHz in-memory, then
-   runs VAD/ASR/SPK and returns `asr.txt`.
+2. `2/4 ASR` — ffmpeg extracts 48 kHz mono; Rust denoises it in-process with
+   DeepFilterNet (ONNX via the `df` crate), downsamples to 16 kHz, then the
+   resident `audio_server.py` runs VAD/ASR/SPK and returns `asr.txt`.
 3. `3/4 Visual` — ffmpeg (hardware-accelerated) decodes 1 fps frames; the
    visual server (VideoNeko, resident) classifies them and returns `visual.txt`.
    Stages 2 and 3 run **in parallel** per part. Multi-part inputs are analysed

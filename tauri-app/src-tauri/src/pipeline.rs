@@ -1,5 +1,6 @@
 use crate::assets::Assets;
 use crate::config::AppConfig;
+use crate::df_denoise::Denoiser;
 use crate::model_ipc::{log_line, ModelServer};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -196,12 +197,10 @@ impl Runner {
             self.assets.audio_model_dir.display().to_string(),
             "--ref-dir".to_string(),
             refs_dir.display().to_string(),
-            "--filter-model-dir".to_string(),
-            self.assets.filter_model_dir.display().to_string(),
         ];
         self.emit_log(
             "pipeline",
-            "[model] loading audio models (filter/VAD/ASR/SPK)...".to_string(),
+            "[model] loading audio models (VAD/ASR/SPK)...".to_string(),
         );
         let audio = ModelServer::spawn(
             &self.app,
@@ -256,12 +255,15 @@ impl Runner {
         }
     }
 
-    /// Run, per part, in parallel: audio thread: ffmpeg extract 48 kHz (video -> raw_wav) -> process (raw_wav -> denoise + downsample + VAD/ASR/SPK -> raw utterances) visual thread: ffmpeg GPU decode (video -> frames_raw RGB blob) -> predict (frames_raw -> raw per-second labels)
-    /// The model workers only run inference; Rust extracts and writes the per-part asr.txt/visual.txt files from the returned raw results.
+    /// Run, per part, in parallel:
+    /// audio thread: ffmpeg extract 48 kHz (video -> raw_wav) -> Rust denoise (raw_wav -> filtered_16k_wav) -> Python VAD/ASR/SPK -> raw utterances
+    /// visual thread: ffmpeg GPU decode (video -> frames_raw RGB blob) -> predict (frames_raw -> raw per-second labels)
+    /// The model workers only run inference; Rust extracts, denoises, and writes the per-part asr.txt/visual.txt files from the returned raw results.
     pub fn run_audio_visual(
         &mut self,
         item_id: &str,
         raw_wav: &Path,
+        filtered_wav: &Path,
         video: &Path,
         frames_raw: &Path,
         asr_txt: &Path,
@@ -270,7 +272,7 @@ impl Runner {
         let process_req = serde_json::json!({
             "cmd": "process",
             "id": item_id,
-            "input": raw_wav.display().to_string(),
+            "input": filtered_wav.display().to_string(),
         });
         let visual_req = serde_json::json!({
             "cmd": "predict",
@@ -296,14 +298,15 @@ impl Runner {
             .visual_server
             .as_mut()
             .ok_or("visual model server is not running")?;
-
-        // Run the audio chain (extract -> process) and the visual chain (decode -> predict) concurrently.
+        // Run the audio chain (extract -> denoise -> ASR) and the visual chain (decode -> predict) concurrently.
+        let filter_model_tar = self.assets.filter_model_tar.clone();
         let (audio_res, visual_res) = std::thread::scope(|s| {
             let a_app = app.clone();
             let a_id = id.clone();
             let a_pids = ffmpeg_pids.clone();
             let a_log = log_file.clone();
             let a_cancel = cancel.clone();
+            let a_filter_tar = filter_model_tar.clone();
             let a = s.spawn(move || {
                 // Stage 2: extract raw 48 kHz audio.
                 run_ffmpeg(
@@ -314,7 +317,25 @@ impl Runner {
                     &a_id,
                     &ffmpeg_extract_args(video, raw_wav),
                 )?;
-                // Stage 2: denoise + VAD/ASR/SPK (progress 0..20 denoise, 20..100 ASR).
+                // Stage 2: Rust DeepFilterNet denoise (raw 48 kHz -> filtered 16 kHz), progress 0..20.
+                {
+                    let app2 = a_app.clone();
+                    let id2 = a_id.clone();
+                    let mut denoiser = Denoiser::new(&a_filter_tar)?;
+                    denoiser.process_file(raw_wav, filtered_wav, &a_cancel, &|p| {
+                        let _ = app2.emit(
+                            "pipeline://stage",
+                            serde_json::json!({
+                                "itemId": id2,
+                                "stage": 2,
+                                "progress": p,
+                                "part": part,
+                                "totalParts": total_parts,
+                            }),
+                        );
+                    })?;
+                }
+                // Stage 2: VAD/ASR/SPK (progress 20..100, emitted by audio_server).
                 audio_server.request(&a_app, &a_id, 2, part, total_parts, process_req)
             });
             let v_pids = ffmpeg_pids.clone();
@@ -1492,10 +1513,11 @@ pub fn run_item(
         runner.emit_stage(&id, 2, 0);
         runner.emit_stage(&id, 3, 0);
         let raw_wav = work_dir.join(format!("raw{part_tag}.wav"));
+        let filtered_wav = work_dir.join(format!("filtered{part_tag}.wav"));
         let frames_raw = work_dir.join(format!("frames{part_tag}.raw"));
         let asr_part = work_dir.join(format!("asr{part_tag}.txt"));
         let visual_part = work_dir.join(format!("visual{part_tag}.txt"));
-        runner.run_audio_visual(&id, &raw_wav, video, &frames_raw, &asr_part, &visual_part)?;
+        runner.run_audio_visual(&id, &raw_wav, &filtered_wav, video, &frames_raw, &asr_part, &visual_part)?;
         runner.emit_log(&id, format!("Raw audio: {}", raw_wav.display()));
         runner.emit_stage(&id, 2, 100);
         runner.emit_stage(&id, 3, 100);

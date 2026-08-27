@@ -3,6 +3,8 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- Pre-CSS hint: both schemes supported; :root CSS + main.js set the applied one -->
+    <meta name="color-scheme" content="dark light" />
     <title>LiveNeko</title>
     <link rel="stylesheet" href="/src/styles.css" />
   </head>
@@ -161,7 +163,7 @@
           <div class="card">
             <h2 data-i18n="settings.promptTitle">Summary prompt</h2>
             <p class="hint" data-i18n="settings.promptHint">System prompt sent to the summarization model. Edit freely; it is stored locally. Empty → reset to the bundled default.</p>
-            <textarea id="cfg-prompt" rows="14" spellcheck="false" style="width:100%;font-family:Consolas,monospace;font-size:12px;background:var(--card2);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:10px;"></textarea>
+            <textarea id="cfg-prompt" rows="14" spellcheck="false"></textarea>
             <div class="row">
               <button id="btn-reset-prompt" class="btn ghost small" data-i18n="settings.resetPrompt">Reset to default</button>
             </div>

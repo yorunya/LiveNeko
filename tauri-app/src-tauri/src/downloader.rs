@@ -598,9 +598,7 @@ impl Downloader {
         Ok(key)
     }
 
-    /// Randomised danmaku/fingerprint params that Bilibili expects on playurl
-    /// requests (mirrors `BilibiliBaseIE._dm_params`). Sending these materially
-    /// reduces `-352` risk-control rejections on unauthenticated requests.
+    /// Randomised danmaku/fingerprint params that Bilibili expects on playurl requests (mirrors `BilibiliBaseIE._dm_params`). Sending these materially reduces `-352` risk-control rejections on unauthenticated requests.
     fn bilibili_dm_params(&self) -> Vec<(String, String)> {
         struct Rng(u64);
         impl Rng {

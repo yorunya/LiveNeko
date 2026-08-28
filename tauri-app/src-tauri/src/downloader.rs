@@ -1,26 +1,4 @@
 //! In-process, unauthenticated video downloader for Bilibili and YouTube.
-//!
-//! This replaces the external `yt-dlp.exe` invocation with the same public
-//! web APIs that yt-dlp uses (see `./yt-dlp` source checkout):
-//!
-//! * Bilibili — `yt_dlp/extractor/bilibili.py` (`BiliBiliIE`):
-//!   1. `GET https://www.bilibili.com/video/<bvid>` and parse
-//!      `window.__INITIAL_STATE__` (title + first cid) plus `window.__playinfo__`.
-//!   2. `GET https://api.bilibili.com/x/player/wbi/playurl` (WBI-signed,
-//!      `fnval=4048`, `try_look=1`) to get DASH video/audio stream URLs.
-//!   3. Download each `.m4s` segment and merge to mp4 with ffmpeg.
-//!   4. Anthology (`?p=N`) and festival pages are handled via
-//!      `x/player/pagelist` and `x/web-interface/wbi/view/detail`.
-//!
-//! * YouTube — `yt_dlp/extractor/youtube/_video.py` + `_base.py`:
-//!   1. `GET https://www.youtube.com/watch?v=<id>` and parse
-//!      `ytInitialPlayerResponse` / `ytInitialData`.
-//!   2. POST to `https://www.youtube.com/youtubei/v1/player` using the
-//!      `visionos` / `web` Innertube clients (no login, no PO token) to get
-//!      `streamingData.formats` / `adaptiveFormats`.
-//!   3. Download the best progressive or bestvideo+bestaudio format.
-//!
-//! All requests are anonymous; no cookies or account credentials are used.
 
 use serde_json::Value;
 use std::collections::HashMap;
@@ -35,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// A minimal blocking HTTP client backed by `curl` (bundled with Windows 10+).
 /// This avoids pulling a full HTTP/TLS stack into the binary while still
-/// performing unauthenticated HTTPS requests exactly like yt-dlp does.
+
 struct HttpClient {
     /// Additional headers that every request should carry.
     default_headers: Vec<(String, String)>,
@@ -230,7 +208,12 @@ mod md5 {
         for chunk in msg.chunks_exact(64) {
             let mut m = [0u32; 16];
             for (i, w) in m.iter_mut().enumerate() {
-                *w = u32::from_le_bytes([chunk[i * 4], chunk[i * 4 + 1], chunk[i * 4 + 2], chunk[i * 4 + 3]]);
+                *w = u32::from_le_bytes([
+                    chunk[i * 4],
+                    chunk[i * 4 + 1],
+                    chunk[i * 4 + 2],
+                    chunk[i * 4 + 3],
+                ]);
             }
             let (mut a, mut b, mut c, mut d) = (a0, b0, c0, d0);
             for i in 0..64 {
@@ -240,10 +223,7 @@ mod md5 {
                     2 => (b ^ c ^ d, (3 * i + 5) % 16),
                     _ => (c ^ (b | !d), (7 * i) % 16),
                 };
-                f = f
-                    .wrapping_add(a)
-                    .wrapping_add(K[i])
-                    .wrapping_add(m[g]);
+                f = f.wrapping_add(a).wrapping_add(K[i]).wrapping_add(m[g]);
                 a = d;
                 d = c;
                 c = b;
@@ -361,7 +341,12 @@ impl Downloader {
     /// Download a single video (or all parts of an anthology) into `out_dir`.
     /// `quality` is the maximum height (360/480/720/1080).
     /// Returns the list of downloaded media files in order.
-    pub fn download(&self, url: &str, out_dir: &Path, quality: u32) -> Result<Vec<PathBuf>, String> {
+    pub fn download(
+        &self,
+        url: &str,
+        out_dir: &Path,
+        quality: u32,
+    ) -> Result<Vec<PathBuf>, String> {
         std::fs::create_dir_all(out_dir).map_err(|e| format!("create dir: {e}"))?;
         if url.contains("bilibili.com") {
             self.bilibili_download(url, out_dir, quality)
@@ -377,11 +362,138 @@ impl Downloader {
     // -----------------------------------------------------------------------
 
     fn bilibili_probe_titles(&self, url: &str) -> Result<Vec<String>, String> {
-        let html = self.http.get_text(url, &[("Referer", "https://www.bilibili.com/")])?;
-        let initial = extract_json_object(&html, "window.__INITIAL_STATE__")
-            .or_else(|| extract_json_object(&html, "window.__INITIAL_STATE__ "))
-            .ok_or("could not find __INITIAL_STATE__")?;
+        let meta = self.bilibili_meta(url)?;
+        if meta.pages.len() > 1 {
+            Ok(meta
+                .pages
+                .iter()
+                .enumerate()
+                .map(|(i, (_, _, part))| format!("{} p{:02} {}", meta.title, i + 1, part))
+                .collect())
+        } else {
+            Ok(vec![meta.title])
+        }
+    }
 
+    fn bilibili_download(
+        &self,
+        url: &str,
+        out_dir: &Path,
+        quality: u32,
+    ) -> Result<Vec<PathBuf>, String> {
+        self.log(format!("[downloader] downloading {url}"));
+        let meta = self.bilibili_meta(url)?;
+
+        // If a specific ?p= is requested, keep only that page.
+        let part_id = query_param(url, "p").and_then(|v| v.parse::<u32>().ok());
+        let selected: Vec<(u32, u64, String)> = if let Some(pid) = part_id {
+            meta.pages
+                .iter()
+                .filter(|(p, _, _)| *p == pid)
+                .cloned()
+                .collect()
+        } else {
+            meta.pages.clone()
+        };
+        if selected.is_empty() {
+            return Err(format!("no video page p{} found", part_id.unwrap_or(0)));
+        }
+        let multiple = selected.len() > 1;
+        self.log(format!("URL yields {} video(s)", selected.len()));
+
+        let mut files = Vec::new();
+        for (idx, (_page, cid, part_title)) in selected.iter().enumerate() {
+            if self.cancel.load(Ordering::SeqCst) {
+                return Err("cancelled".into());
+            }
+            let play_info = self.bilibili_playurl(&meta.bvid, *cid)?;
+            let filename = if multiple {
+                format!(
+                    "{:03}_{} [{}].mp4",
+                    idx + 1,
+                    sanitize_filename(part_title),
+                    meta.bvid
+                )
+            } else {
+                format!("{} [{}].mp4", sanitize_filename(&meta.title), meta.bvid)
+            };
+            let dest = out_dir.join(filename);
+            self.bilibili_download_playinfo(&play_info, &dest, url, quality)?;
+            files.push(dest);
+        }
+        Ok(files)
+    }
+
+    /// Resolve a Bilibili URL into bvid/title/pages. Prefers the unsigned
+    /// `x/web-interface/view` API, which keeps working when the HTML page is
+    /// risk-blocked (HTTP 412 / code -352); falls back to scraping
+    /// `__INITIAL_STATE__` from the page (also covers festival pages).
+    fn bilibili_meta(&self, url: &str) -> Result<BiliMeta, String> {
+        if let Some((id, is_bvid)) = bilibili_id_from_url(url) {
+            let q = if is_bvid {
+                format!("bvid={}", urlencode(&id))
+            } else {
+                format!("aid={}", urlencode(id.trim_start_matches("av")))
+            };
+            if let Ok(v) = self.http.get_json(
+                &format!("https://api.bilibili.com/x/web-interface/view?{q}"),
+                &[("Referer", "https://www.bilibili.com/")],
+            ) {
+                let code = v.get("code").and_then(Value::as_i64).unwrap_or(-1);
+                if code == 0 {
+                    if let Some(d) = v.get("data") {
+                        let bvid = d
+                            .get("bvid")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let title = d
+                            .get("title")
+                            .and_then(Value::as_str)
+                            .unwrap_or("video")
+                            .to_string();
+                        let mut pages = Vec::new();
+                        if let Some(arr) = d.get("pages").and_then(Value::as_array) {
+                            for p in arr {
+                                let page =
+                                    p.get("page").and_then(Value::as_u64).unwrap_or(1) as u32;
+                                let cid = p.get("cid").and_then(Value::as_u64).unwrap_or(0);
+                                let part = p
+                                    .get("part")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string();
+                                if cid != 0 {
+                                    pages.push((page, cid, part));
+                                }
+                            }
+                        }
+                        if pages.is_empty() {
+                            let cid = d.get("cid").and_then(Value::as_u64).unwrap_or(0);
+                            if cid != 0 {
+                                pages.push((1, cid, title.clone()));
+                            }
+                        }
+                        if !bvid.is_empty() && !pages.is_empty() {
+                            return Ok(BiliMeta { bvid, title, pages });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback: scrape the HTML page (festival pages etc.).
+        let html = self
+            .http
+            .get_text(url, &[("Referer", "https://www.bilibili.com/")])?;
+        let initial = extract_json_object(&html, "window.__INITIAL_STATE__").ok_or_else(|| {
+            if html.contains("v_voucher") || html.contains("err-code\">412") {
+                "bilibili risk control rejected the request (rate limited); try again later"
+                    .to_string()
+            } else {
+                "could not find __INITIAL_STATE__ on the bilibili page".to_string()
+            }
+        })?;
         // Festival pages have a different layout.
         let is_festival = initial.get("videoData").is_none();
         let video_data = if is_festival {
@@ -395,54 +507,6 @@ impl Downloader {
                 .cloned()
                 .ok_or("no videoData in initial state")?
         };
-        let title = video_data
-            .get("title")
-            .and_then(Value::as_str)
-            .unwrap_or("video")
-            .to_string();
-
-        // Anthology = multiple pages under one bvid.
-        let mut titles = vec![title.clone()];
-        if !is_festival {
-            if let Some(bvid) = video_data.get("bvid").and_then(Value::as_str) {
-                let pl = self.http.get_json(
-                    &format!("https://api.bilibili.com/x/player/pagelist?bvid={bvid}&jsonp=jsonp"),
-                    &[("Referer", "https://www.bilibili.com/")],
-                );
-                if let Ok(pl) = pl {
-                    if let Some(data) = pl.get("data").and_then(Value::as_array) {
-                        if data.len() > 1 {
-                            titles = data
-                                .iter()
-                                .enumerate()
-                                .map(|(i, p)| {
-                                    format!(
-                                        "{} p{:02} {}",
-                                        title,
-                                        i + 1,
-                                        p.get("part").and_then(Value::as_str).unwrap_or("")
-                                    )
-                                })
-                                .collect();
-                        }
-                    }
-                }
-            }
-        }
-        Ok(titles)
-    }
-
-    fn bilibili_download(&self, url: &str, out_dir: &Path, quality: u32) -> Result<Vec<PathBuf>, String> {
-        self.log(format!("[downloader] downloading {url}"));
-        let html = self.http.get_text(url, &[("Referer", "https://www.bilibili.com/")])?;
-        let initial = extract_json_object(&html, "window.__INITIAL_STATE__")
-            .ok_or("could not find __INITIAL_STATE__")?;
-        let is_festival = initial.get("videoData").is_none();
-        let video_data = if is_festival {
-            initial.get("videoInfo").cloned().ok_or("no videoInfo")?
-        } else {
-            initial.get("videoData").cloned().ok_or("no videoData")?
-        };
         let bvid = video_data
             .get("bvid")
             .and_then(Value::as_str)
@@ -453,71 +517,31 @@ impl Downloader {
             .and_then(Value::as_str)
             .unwrap_or("video")
             .to_string();
-
-        // Determine which parts to download.
-        let part_id = query_param(url, "p").and_then(|v| v.parse::<u32>().ok());
-        let mut pages: Vec<(u32, String)> = Vec::new();
-        if !is_festival {
-            if let Ok(pl) = self.http.get_json(
-                &format!("https://api.bilibili.com/x/player/pagelist?bvid={bvid}&jsonp=jsonp"),
-                &[("Referer", "https://www.bilibili.com/")],
-            ) {
-                if let Some(data) = pl.get("data").and_then(Value::as_array) {
-                    for p in data {
-                        let page = p.get("page").and_then(Value::as_u64).unwrap_or(1) as u32;
-                        let part = p.get("part").and_then(Value::as_str).unwrap_or("").to_string();
-                        pages.push((page, part));
-                    }
+        let mut pages = Vec::new();
+        if let Some(arr) = video_data.get("pages").and_then(Value::as_array) {
+            for p in arr {
+                let page = p.get("page").and_then(Value::as_u64).unwrap_or(1) as u32;
+                let cid = p.get("cid").and_then(Value::as_u64).unwrap_or(0);
+                let part = p
+                    .get("part")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                if cid != 0 {
+                    pages.push((page, cid, part));
                 }
             }
         }
         if pages.is_empty() {
-            pages.push((1, title.clone()));
-        }
-
-        // If a specific ?p= is requested, keep only that page.
-        let selected: Vec<(u32, String)> = if let Some(pid) = part_id {
-            pages.into_iter().filter(|(p, _)| *p == pid).collect()
-        } else {
-            pages
-        };
-        let multiple = selected.len() > 1;
-        self.log(format!("URL yields {} video(s)", selected.len()));
-
-        let mut files = Vec::new();
-        for (idx, (page, part_title)) in selected.iter().enumerate() {
-            if self.cancel.load(Ordering::SeqCst) {
-                return Err("cancelled".into());
+            let cid = video_data.get("cid").and_then(Value::as_u64).unwrap_or(0);
+            if cid != 0 {
+                pages.push((1, cid, title.clone()));
             }
-            let cid = if is_festival {
-                video_data.get("cid").and_then(Value::as_u64).unwrap_or(0)
-            } else {
-                video_data
-                    .get("pages")
-                    .and_then(Value::as_array)
-                    .and_then(|a| a.get((*page as usize).saturating_sub(1)))
-                    .and_then(|p| p.get("cid").and_then(Value::as_u64))
-                    .unwrap_or_else(|| video_data.get("cid").and_then(Value::as_u64).unwrap_or(0))
-            };
-            if cid == 0 {
-                return Err(format!("could not resolve cid for page {page}"));
-            }
-            let play_info = self.bilibili_playurl(&bvid, cid)?;
-            let filename = if multiple {
-                format!(
-                    "{:03}_{} [{}].mp4",
-                    idx + 1,
-                    sanitize_filename(part_title),
-                    bvid
-                )
-            } else {
-                format!("{} [{}].mp4", sanitize_filename(&title), bvid)
-            };
-            let dest = out_dir.join(filename);
-            self.bilibili_download_playinfo(&play_info, &dest, url, quality)?;
-            files.push(dest);
         }
-        Ok(files)
+        if bvid.is_empty() || pages.is_empty() {
+            return Err("could not resolve bilibili video metadata".into());
+        }
+        Ok(BiliMeta { bvid, title, pages })
     }
 
     /// Bilibili WBI signing (see `BilibiliBaseIE._sign_wbi`).
@@ -534,8 +558,20 @@ impl Downloader {
             .pointer("/data/wbi_img/sub_url")
             .and_then(Value::as_str)
             .unwrap_or("");
-        let img_key = img.rsplit('/').next().unwrap_or("").split('.').next().unwrap_or("");
-        let sub_key = sub.rsplit('/').next().unwrap_or("").split('.').next().unwrap_or("");
+        let img_key = img
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .split('.')
+            .next()
+            .unwrap_or("");
+        let sub_key = sub
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .split('.')
+            .next()
+            .unwrap_or("");
         let lookup = format!("{img_key}{sub_key}");
         const MIXIN_KEY_ENC_TAB: [usize; 64] = [
             46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49, 33, 9, 42,
@@ -565,7 +601,7 @@ impl Downloader {
         ]
         .into_iter()
         .collect();
-        // Remove chars that must be stripped per yt-dlp: '!'()*'
+        // Remove chars that must be stripped
         let mut sorted: Vec<(String, String)> = params
             .iter()
             .map(|(k, v)| {
@@ -589,7 +625,9 @@ impl Downloader {
         qs.push_str(&format!("&w_rid={}", urlencode(&params["w_rid"])));
 
         let url = format!("https://api.bilibili.com/x/player/wbi/playurl?{qs}");
-        let raw = self.http.get_json(&url, &[("Referer", "https://www.bilibili.com/")])?;
+        let raw = self
+            .http
+            .get_json(&url, &[("Referer", "https://www.bilibili.com/")])?;
         let code = raw.get("code").and_then(Value::as_i64).unwrap_or(-1);
         if code != 0 {
             let msg = raw
@@ -633,7 +671,11 @@ impl Downloader {
                     .unwrap_or(false)
             })
             .max_by_key(|v| v.get("height").and_then(Value::as_u64).unwrap_or(0))
-            .or_else(|| videos.iter().max_by_key(|v| v.get("height").and_then(Value::as_u64).unwrap_or(0)))
+            .or_else(|| {
+                videos
+                    .iter()
+                    .max_by_key(|v| v.get("height").and_then(Value::as_u64).unwrap_or(0))
+            })
             .cloned()
             .ok_or("bilibili: no suitable video format")?;
         let best_audio = audios
@@ -666,9 +708,14 @@ impl Downloader {
                 let mut f = on_progress.lock().unwrap();
                 (f)(p / 2);
             }
-        })
-            as Box<dyn FnMut(u8) + Send>));
-        self.http.download_file(video_url, &tmp_video, &headers, &self.cancel, video_progress)?;
+        }) as Box<dyn FnMut(u8) + Send>));
+        self.http.download_file(
+            video_url,
+            &tmp_video,
+            &headers,
+            &self.cancel,
+            video_progress,
+        )?;
 
         if let Some(aurl) = audio_url {
             let audio_progress = Arc::new(Mutex::new(Box::new({
@@ -677,17 +724,15 @@ impl Downloader {
                     let mut f = on_progress.lock().unwrap();
                     (f)(50 + p * 3 / 10);
                 }
-            })
-                as Box<dyn FnMut(u8) + Send>));
-            self.http.download_file(&aurl, &tmp_audio, &headers, &self.cancel, audio_progress)?;
+            }) as Box<dyn FnMut(u8) + Send>));
+            self.http
+                .download_file(&aurl, &tmp_audio, &headers, &self.cancel, audio_progress)?;
         }
 
         self.progress(80);
-        // Merge with ffmpeg (same as yt-dlp's --merge-output-format mp4).
+        // Merge with ffmpeg
         let mut cmd = std::process::Command::new(&self.ffmpeg);
-        cmd.arg("-y")
-            .arg("-i")
-            .arg(&tmp_video);
+        cmd.arg("-y").arg("-i").arg(&tmp_video);
         if tmp_audio.exists() {
             cmd.arg("-i").arg(&tmp_audio);
         }
@@ -726,7 +771,12 @@ impl Downloader {
         Ok(vec![title])
     }
 
-    fn youtube_download(&self, url: &str, out_dir: &Path, quality: u32) -> Result<Vec<PathBuf>, String> {
+    fn youtube_download(
+        &self,
+        url: &str,
+        out_dir: &Path,
+        quality: u32,
+    ) -> Result<Vec<PathBuf>, String> {
         self.log(format!("[downloader] downloading {url}"));
         let video_id = youtube_video_id(url).ok_or("could not parse YouTube video id")?;
         let pr = self.youtube_player_response(&video_id)?;
@@ -772,21 +822,31 @@ impl Downloader {
                     let mut f = on_progress.lock().unwrap();
                     (f)(p);
                 }
-            })
-                as Box<dyn FnMut(u8) + Send>));
-            self.http.download_file(url, &dest, &[], &self.cancel, progress)?;
+            }) as Box<dyn FnMut(u8) + Send>));
+            self.http
+                .download_file(url, &dest, &[], &self.cancel, progress)?;
             return Ok(vec![dest]);
         }
 
         // Fallback: best video + best audio (adaptive), then merge.
         let videos: Vec<Value> = formats
             .iter()
-            .filter(|f| f.get("mimeType").and_then(Value::as_str).map(|m| m.starts_with("video/")).unwrap_or(false))
+            .filter(|f| {
+                f.get("mimeType")
+                    .and_then(Value::as_str)
+                    .map(|m| m.starts_with("video/"))
+                    .unwrap_or(false)
+            })
             .cloned()
             .collect();
         let audios: Vec<Value> = formats
             .iter()
-            .filter(|f| f.get("mimeType").and_then(Value::as_str).map(|m| m.starts_with("audio/")).unwrap_or(false))
+            .filter(|f| {
+                f.get("mimeType")
+                    .and_then(Value::as_str)
+                    .map(|m| m.starts_with("audio/"))
+                    .unwrap_or(false)
+            })
             .cloned()
             .collect();
         let best_video = videos
@@ -798,7 +858,11 @@ impl Downloader {
                     .unwrap_or(false)
             })
             .max_by_key(|v| v.get("height").and_then(Value::as_u64).unwrap_or(0))
-            .or_else(|| videos.iter().max_by_key(|v| v.get("height").and_then(Value::as_u64).unwrap_or(0)))
+            .or_else(|| {
+                videos
+                    .iter()
+                    .max_by_key(|v| v.get("height").and_then(Value::as_u64).unwrap_or(0))
+            })
             .cloned()
             .ok_or("youtube: no suitable video format")?;
         let best_audio = audios
@@ -807,8 +871,14 @@ impl Downloader {
             .cloned()
             .ok_or("youtube: no audio format")?;
 
-        let video_url = best_video.get("url").and_then(Value::as_str).ok_or("youtube: video url missing")?;
-        let audio_url = best_audio.get("url").and_then(Value::as_str).ok_or("youtube: audio url missing")?;
+        let video_url = best_video
+            .get("url")
+            .and_then(Value::as_str)
+            .ok_or("youtube: video url missing")?;
+        let audio_url = best_audio
+            .get("url")
+            .and_then(Value::as_str)
+            .ok_or("youtube: audio url missing")?;
 
         let tmp_video = dest.with_extension("video.m4v");
         let tmp_audio = dest.with_extension("audio.m4a");
@@ -818,18 +888,18 @@ impl Downloader {
                 let mut f = on_progress.lock().unwrap();
                 (f)(p / 2);
             }
-        })
-            as Box<dyn FnMut(u8) + Send>));
-        self.http.download_file(video_url, &tmp_video, &[], &self.cancel, video_progress)?;
+        }) as Box<dyn FnMut(u8) + Send>));
+        self.http
+            .download_file(video_url, &tmp_video, &[], &self.cancel, video_progress)?;
         let audio_progress = Arc::new(Mutex::new(Box::new({
             let on_progress = self.on_progress.clone();
             move |p: u8| {
                 let mut f = on_progress.lock().unwrap();
                 (f)(50 + p * 3 / 10);
             }
-        })
-            as Box<dyn FnMut(u8) + Send>));
-        self.http.download_file(audio_url, &tmp_audio, &[], &self.cancel, audio_progress)?;
+        }) as Box<dyn FnMut(u8) + Send>));
+        self.http
+            .download_file(audio_url, &tmp_audio, &[], &self.cancel, audio_progress)?;
         self.progress(80);
 
         let mut cmd = std::process::Command::new(&self.ffmpeg);
@@ -897,7 +967,10 @@ impl Downloader {
             match self.http.post_json(
                 &format!("https://www.youtube.com/youtubei/v1/player?prettyPrint=false"),
                 &body,
-                &[("Origin", "https://www.youtube.com"), ("Referer", "https://www.youtube.com/")],
+                &[
+                    ("Origin", "https://www.youtube.com"),
+                    ("Referer", "https://www.youtube.com/"),
+                ],
             ) {
                 Ok(pr) => {
                     let status = pr
@@ -923,6 +996,40 @@ impl Downloader {
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
+
+/// Resolved Bilibili video metadata (from the view API or the HTML page).
+struct BiliMeta {
+    bvid: String,
+    title: String,
+    /// (page number, cid, part title)
+    pages: Vec<(u32, u64, String)>,
+}
+
+/// Extract the Bilibili video id from a URL. Returns `(id, is_bvid)`.
+fn bilibili_id_from_url(url: &str) -> Option<(String, bool)> {
+    if let Some(rest) = query_param(url, "bvid") {
+        if !rest.is_empty() {
+            return Some((rest, true));
+        }
+    }
+    if let Some(pos) = url.find("/video/") {
+        let rest = &url[pos + 7..];
+        let id: String = rest
+            .chars()
+            .take_while(|c| !matches!(c, '?' | '#' | '/'))
+            .collect();
+        if !id.is_empty() {
+            let lower = id.to_lowercase();
+            if lower.starts_with("bv") {
+                return Some((id, true));
+            }
+            if lower.starts_with("av") {
+                return Some((id, false));
+            }
+        }
+    }
+    None
+}
 
 /// Extract a balanced JSON object that starts after `marker`.
 fn extract_json_object(text: &str, marker: &str) -> Option<Value> {
@@ -964,17 +1071,29 @@ fn extract_json_object(text: &str, marker: &str) -> Option<Value> {
 fn youtube_video_id(url: &str) -> Option<String> {
     // youtu.be/<id>
     if let Some(rest) = url.strip_prefix("https://youtu.be/") {
-        return Some(rest.split(|c| c == '?' || c == '&' || c == '/').next()?.to_string());
+        return Some(
+            rest.split(|c| c == '?' || c == '&' || c == '/')
+                .next()?
+                .to_string(),
+        );
     }
     // watch?v=<id>
     if url.contains("youtube.com/watch") {
         return query_param(url, "v");
     }
     // shorts/<id>, embed/<id>, live/<id>
-    for pat in ["youtube.com/shorts/", "youtube.com/embed/", "youtube.com/live/"] {
+    for pat in [
+        "youtube.com/shorts/",
+        "youtube.com/embed/",
+        "youtube.com/live/",
+    ] {
         if let Some(pos) = url.find(pat) {
             let rest = &url[pos + pat.len()..];
-            return Some(rest.split(|c| c == '?' || c == '&' || c == '/').next()?.to_string());
+            return Some(
+                rest.split(|c| c == '?' || c == '&' || c == '/')
+                    .next()?
+                    .to_string(),
+            );
         }
     }
     None
@@ -996,7 +1115,10 @@ mod tests {
     #[test]
     fn test_md5() {
         assert_eq!(md5::hex_digest(b""), "d41d8cd98f00b204e9800998ecf8427e");
-        assert_eq!(md5::hex_digest(b"hello"), "5d41402abc4b2a76b9719d911017c592");
+        assert_eq!(
+            md5::hex_digest(b"hello"),
+            "5d41402abc4b2a76b9719d911017c592"
+        );
     }
 
     #[test]
@@ -1009,17 +1131,54 @@ mod tests {
 
     #[test]
     fn test_youtube_id() {
-        assert_eq!(youtube_video_id("https://www.youtube.com/watch?v=abc123"), Some("abc123".into()));
-        assert_eq!(youtube_video_id("https://youtu.be/abc123?t=10"), Some("abc123".into()));
-        assert_eq!(youtube_video_id("https://www.youtube.com/shorts/xyz789"), Some("xyz789".into()));
+        assert_eq!(
+            youtube_video_id("https://www.youtube.com/watch?v=abc123"),
+            Some("abc123".into())
+        );
+        assert_eq!(
+            youtube_video_id("https://youtu.be/abc123?t=10"),
+            Some("abc123".into())
+        );
+        assert_eq!(
+            youtube_video_id("https://www.youtube.com/shorts/xyz789"),
+            Some("xyz789".into())
+        );
+    }
+
+    #[test]
+    fn test_bilibili_id() {
+        assert_eq!(
+            bilibili_id_from_url("https://www.bilibili.com/video/BV1gKdQBiELm"),
+            Some(("BV1gKdQBiELm".into(), true))
+        );
+        assert_eq!(
+            bilibili_id_from_url("https://www.bilibili.com/video/BV1gKdQBiELm?p=2"),
+            Some(("BV1gKdQBiELm".into(), true))
+        );
+        assert_eq!(
+            bilibili_id_from_url("https://www.bilibili.com/festival/bh3-7th?bvid=BV1tr4y1f7p2&"),
+            Some(("BV1tr4y1f7p2".into(), true))
+        );
+        assert_eq!(
+            bilibili_id_from_url("https://www.bilibili.com/video/av170001"),
+            Some(("av170001".into(), false))
+        );
+        assert_eq!(
+            bilibili_id_from_url("https://www.youtube.com/watch?v=x"),
+            None
+        );
     }
 
     // Live network tests (no auth). Run with: cargo test --lib downloader::tests::live -- --ignored --nocapture
     fn live_dl() -> Downloader {
         Downloader::new(
             Arc::new(AtomicBool::new(false)),
-            Arc::new(Mutex::new(Box::new(|p: u8| eprintln!("  progress {p}%")) as Box<dyn FnMut(u8) + Send>)),
-            Arc::new(Mutex::new(Box::new(|l: String| eprintln!("  {l}")) as Box<dyn FnMut(String) + Send>)),
+            Arc::new(Mutex::new(
+                Box::new(|p: u8| eprintln!("  progress {p}%")) as Box<dyn FnMut(u8) + Send>
+            )),
+            Arc::new(Mutex::new(
+                Box::new(|l: String| eprintln!("  {l}")) as Box<dyn FnMut(String) + Send>
+            )),
         )
     }
 
@@ -1027,7 +1186,9 @@ mod tests {
     #[ignore]
     fn live_bilibili_probe() {
         let d = live_dl();
-        let titles = d.probe_titles("https://www.bilibili.com/video/BV1E7uU6tEPA").unwrap();
+        let url = std::env::var("BILI_TEST_URL")
+            .unwrap_or_else(|_| "https://www.bilibili.com/video/BV1E7uU6tEPA".into());
+        let titles = d.probe_titles(&url).unwrap();
         eprintln!("bilibili titles: {titles:?}");
         assert!(!titles.is_empty());
     }
@@ -1036,8 +1197,10 @@ mod tests {
     #[ignore]
     fn live_bilibili_download() {
         let d = live_dl();
+        let url = std::env::var("BILI_TEST_URL")
+            .unwrap_or_else(|_| "https://www.bilibili.com/video/BV1E7uU6tEPA".into());
         let dir = std::env::temp_dir().join("liveneko_bili_test");
-        let files = d.download("https://www.bilibili.com/video/BV1E7uU6tEPA", &dir, 720).unwrap();
+        let files = d.download(&url, &dir, 720).unwrap();
         eprintln!("bilibili files: {files:?}");
         assert!(!files.is_empty());
         assert!(files[0].exists());
@@ -1047,7 +1210,9 @@ mod tests {
     #[ignore]
     fn live_youtube_probe() {
         let d = live_dl();
-        let titles = d.probe_titles("https://www.youtube.com/watch?v=dQw4w9WgXcQ").unwrap();
+        let titles = d
+            .probe_titles("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+            .unwrap();
         eprintln!("youtube titles: {titles:?}");
         assert!(!titles.is_empty());
     }

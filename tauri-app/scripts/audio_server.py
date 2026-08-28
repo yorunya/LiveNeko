@@ -65,14 +65,6 @@ def quiet_stdout():
 
 
 # ---- VAD / ASR / speaker ----
-#
-# All three sub-models are built by a single AutoModel(...) call (see main()).
-# The returned object exposes the raw sub-modules as `.vad_model`, `.model`
-# (ASR) and `.spk_model` plus their resolved configs `.vad_kwargs`, `.kwargs`
-# and `.spk_kwargs`. We call them individually through the unified model's
-# `inference(...)` helper, which runs the same data-iterator + batching path a
-# standalone AutoModel.generate() would, so downstream behavior is unchanged.
-
 
 def load_speech(wav_path, model):
     speech, sr = sf.read(wav_path, dtype="float32")
@@ -196,7 +188,7 @@ def main():
     ap.add_argument("--model-dir", required=True,
                     help="dir containing SenseVoiceSmall/fsmn-vad/cam++")
     ap.add_argument("--ref-dir", required=True,
-                    help="dir with pre-resampled 16 kHz reference wav files")
+                    help="dir with standard 16 kHz mono reference wav files")
     args = ap.parse_args()
 
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -205,8 +197,7 @@ def main():
     log.info("Loading models...")
     try:
         with quiet_stdout():
-            # One AutoModel call builds the ASR model plus the VAD and speaker
-            # sub-models; the same paths/config as before, just unified.
+            # One AutoModel call builds the ASR model plus the VAD and speaker sub-models; the same paths/config as before, just unified.
             model = AutoModel(
                 model=os.path.join(args.model_dir, "SenseVoiceSmall"),
                 vad_model=os.path.join(args.model_dir, "fsmn-vad"),

@@ -34,12 +34,20 @@
       "icons/icon.ico"
     ],
     "resources": {
-      "../../yt-dlp.exe": "yt-dlp.exe",
       "../../prompt.md": "prompt.md",
       "../../spk": "spk",
-      "../../model/SenseVoiceSmall": "model/SenseVoiceSmall",
-      "../../model/fsmn-vad": "model/fsmn-vad",
-      "../../model/cam++": "model/cam++",
+      "../../model/SenseVoiceSmall/model.pt": "model/SenseVoiceSmall/model.pt",
+      "../../model/SenseVoiceSmall/config.yaml": "model/SenseVoiceSmall/config.yaml",
+      "../../model/SenseVoiceSmall/configuration.json": "model/SenseVoiceSmall/configuration.json",
+      "../../model/SenseVoiceSmall/chn_jpn_yue_eng_ko_spectok.bpe.model": "model/SenseVoiceSmall/chn_jpn_yue_eng_ko_spectok.bpe.model",
+      "../../model/SenseVoiceSmall/am.mvn": "model/SenseVoiceSmall/am.mvn",
+      "../../model/fsmn-vad/model.pt": "model/fsmn-vad/model.pt",
+      "../../model/fsmn-vad/config.yaml": "model/fsmn-vad/config.yaml",
+      "../../model/fsmn-vad/configuration.json": "model/fsmn-vad/configuration.json",
+      "../../model/fsmn-vad/am.mvn": "model/fsmn-vad/am.mvn",
+      "../../model/cam++/campplus_cn_common.bin": "model/cam++/campplus_cn_common.bin",
+      "../../model/cam++/config.yaml": "model/cam++/config.yaml",
+      "../../model/cam++/configuration.json": "model/cam++/configuration.json",
       "../../DeepFilterNet/models/DeepFilterNet3_onnx.tar.gz": "model/DeepFilterNet3_onnx.tar.gz",
       "../scripts": "scripts"
     }

@@ -1,7 +1,7 @@
 use crate::assets::Assets;
 use crate::config::AppConfig;
 use crate::df_denoise::Denoiser;
-use crate::model_ipc::{log_line, ModelServer};
+use crate::model_ipc::{ModelServer, log_line};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -156,28 +156,9 @@ impl Runner {
         let pids = self.handle.model_pids.clone();
         let python = config.python_cmd.clone();
 
-        // Prepare 16 kHz speaker references. Rust owns every ffmpeg subprocess, so the audio worker never shells out to ffmpeg.
-        let ref_media = self.assets.spk_refs();
-        if ref_media.is_empty() {
+        // The bundled spk/ references are already standard 16 kHz mono WAVs
+        if self.assets.spk_refs().is_empty() {
             return Err("no speaker reference media found".to_string());
-        }
-        let app_data_dir = self.app.path().app_data_dir().map_err(|e| e.to_string())?;
-        let refs_dir = app_data_dir.join("work").join("refs_16k");
-        let _ = std::fs::remove_dir_all(&refs_dir);
-        std::fs::create_dir_all(&refs_dir).map_err(|e| e.to_string())?;
-        for (i, media) in ref_media.iter().enumerate() {
-            let out = refs_dir.join(format!("ref_{i:03}.wav"));
-            if !self.run_process(
-                "pipeline",
-                Path::new("ffmpeg"),
-                &ffmpeg_resample_args(media, &out, 16000),
-                None,
-            )? {
-                return Err(format!(
-                    "failed to resample speaker reference {}",
-                    media.display()
-                ));
-            }
         }
 
         let audio_script = self.assets.scripts_dir.join("audio_server.py");
@@ -185,7 +166,7 @@ impl Runner {
             "--model-dir".to_string(),
             self.assets.audio_model_dir.display().to_string(),
             "--ref-dir".to_string(),
-            refs_dir.display().to_string(),
+            self.assets.spk_dir.display().to_string(),
         ];
         self.emit_log(
             "pipeline",
@@ -310,8 +291,18 @@ impl Runner {
                 {
                     let app2 = a_app.clone();
                     let id2 = a_id.clone();
+                    // Emit only when the percentage changes (0..20 => <=21 events). The denoiser reports once per hop; emitting each one flooded the
+                    // webview IPC and crashed the app.
+                    let last = Arc::new(Mutex::new(None::<u8>));
                     let mut denoiser = Denoiser::new(&a_filter_tar)?;
+                    let progress_ctx = (app2, id2, last);
                     denoiser.process_file(raw_wav, filtered_wav, &a_cancel, &|p| {
+                        let (app2, id2, last) = &progress_ctx;
+                        let mut last = last.lock().unwrap();
+                        if *last == Some(p) {
+                            return;
+                        }
+                        *last = Some(p);
                         let _ = app2.emit(
                             "pipeline://stage",
                             serde_json::json!({
@@ -434,75 +425,6 @@ impl Runner {
         );
     }
 
-    /// Spawn a process with piped stdout/stderr, forward both to the UI as log lines, parse "PROGRESS <n>" lines into stage progress, kill on cancellation, and wait for completion.
-    fn run_process(
-        &self,
-        item_id: &str,
-        program: &Path,
-        args: &[String],
-        cwd: Option<&Path>,
-    ) -> Result<bool, String> {
-        let mut cmd = Command::new(program);
-        cmd.args(args);
-        if let Some(dir) = cwd {
-            cmd.current_dir(dir);
-        }
-        hide_console(&mut cmd);
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        // Keep the child visible to the stop command.
-        let mut child = cmd.spawn().map_err(|e| format!("spawn failed: {e}"))?;
-        let stdout = child.stdout.take().expect("stdout piped");
-        let stderr = child.stderr.take().expect("stderr piped");
-        *self.handle.child.lock().unwrap() = Some(child);
-
-        let stderr_app = self.app.clone();
-        let item_id3 = item_id.to_string();
-        let log_file = self.handle.log_file.clone();
-        let stderr_handle = std::thread::spawn(move || {
-            use std::io::BufRead;
-            let reader = std::io::BufReader::new(stderr);
-            for line in reader.lines() {
-                if let Ok(l) = line {
-                    log_line(&stderr_app, &log_file, &item_id3, &l);
-                }
-            }
-        });
-
-        // Read stdout in this thread so we can map PROGRESS lines to the UI.
-        use std::io::BufRead;
-        let reader = std::io::BufReader::new(stdout);
-        for line in reader.lines() {
-            if let Ok(l) = line {
-                let trimmed = l.trim();
-                if let Some(rest) = trimmed.strip_prefix("PROGRESS ") {
-                    if let Ok(p) = rest.parse::<u8>() {
-                        self.emit_stage(item_id, self.current_stage, p.min(100));
-                    }
-                } else if !trimmed.is_empty() {
-                    self.emit_log(item_id, l);
-                }
-            }
-        }
-
-        // Take the child back out of the shared handle to wait on it.
-        let status = self
-            .handle
-            .child
-            .lock()
-            .unwrap()
-            .take()
-            .map(|mut c| c.wait())
-            .unwrap_or_else(|| Err(std::io::Error::new(std::io::ErrorKind::Other, "no child")));
-        let status = status.map_err(|e| format!("wait failed: {e}"))?;
-        let _ = stderr_handle.join();
-
-        let cancelled = self.is_cancelled();
-        if cancelled {
-            return Err("cancelled".to_string());
-        }
-        Ok(status.success())
-    }
-
     /// Build a downloader for this item, wiring progress and logs to the UI.
     fn make_downloader(&self, item_id: &str) -> crate::downloader::Downloader {
         let cancel = self.handle.cancel.clone();
@@ -520,15 +442,13 @@ impl Runner {
                     "totalParts": 1,
                 }),
             );
-        })
-            as Box<dyn FnMut(u8) + Send>));
+        }) as Box<dyn FnMut(u8) + Send>));
         let app2 = self.app.clone();
         let item_id2 = item_id.to_string();
         let log_file2 = self.handle.log_file.clone();
         let on_log = Arc::new(Mutex::new(Box::new(move |line: String| {
             log_line(&app2, &log_file2, &item_id2, &line);
-        })
-            as Box<dyn FnMut(String) + Send>));
+        }) as Box<dyn FnMut(String) + Send>));
         crate::downloader::Downloader::new(cancel, on_progress, on_log)
     }
 
@@ -569,7 +489,10 @@ impl Runner {
         out_dir: &Path,
         quality: u32,
     ) -> Result<bool, String> {
-        self.emit_log(item_id, format!("[downloader] downloading all videos: {url}"));
+        self.emit_log(
+            item_id,
+            format!("[downloader] downloading all videos: {url}"),
+        );
         let dl = self.make_downloader(item_id);
         let files = dl.download(url, out_dir, quality)?;
         self.emit_log(
@@ -976,7 +899,9 @@ pub fn simplify_title_str(raw: &str) -> String {
 pub fn probe_ytdlp_titles(_yt_dlp_exe: &Path, url: &str) -> Result<Vec<String>, String> {
     let cancel = Arc::new(AtomicBool::new(false));
     let on_progress = Arc::new(Mutex::new(Box::new(|_: u8| {}) as Box<dyn FnMut(u8) + Send>));
-    let on_log = Arc::new(Mutex::new(Box::new(|_: String| {}) as Box<dyn FnMut(String) + Send>));
+    let on_log = Arc::new(Mutex::new(
+        Box::new(|_: String| {}) as Box<dyn FnMut(String) + Send>
+    ));
     let dl = crate::downloader::Downloader::new(cancel, on_progress, on_log);
     let titles = dl.probe_titles(url)?;
     Ok(titles
@@ -1020,25 +945,6 @@ fn fmt_hms(total: u64) -> String {
 const UTT_MIN_S: f64 = 1.5;
 /// Majority-vote smoothing window (seconds) for visual predictions (was SMOOTH_WINDOW in the old Python visual_server).
 const SMOOTH_WINDOW: usize = 15;
-
-/// ffmpeg args to resample `input` to `sr` Hz mono PCM into `output`.
-fn ffmpeg_resample_args(input: &Path, output: &Path, sr: u32) -> Vec<String> {
-    vec![
-        "-y".to_string(),
-        "-i".to_string(),
-        input.display().to_string(),
-        "-vn".to_string(),
-        "-acodec".to_string(),
-        "pcm_s16le".to_string(),
-        "-ar".to_string(),
-        sr.to_string(),
-        "-ac".to_string(),
-        "1".to_string(),
-        output.display().to_string(),
-        "-loglevel".to_string(),
-        "error".to_string(),
-    ]
-}
 
 /// ffmpeg args to extract 48 kHz mono PCM audio from `video` into `output`.
 fn ffmpeg_extract_args(video: &Path, output: &Path) -> Vec<String> {
@@ -1414,7 +1320,15 @@ pub fn run_item(
         let frames_raw = work_dir.join(format!("frames{part_tag}.raw"));
         let asr_part = work_dir.join(format!("asr{part_tag}.txt"));
         let visual_part = work_dir.join(format!("visual{part_tag}.txt"));
-        runner.run_audio_visual(&id, &raw_wav, &filtered_wav, video, &frames_raw, &asr_part, &visual_part)?;
+        runner.run_audio_visual(
+            &id,
+            &raw_wav,
+            &filtered_wav,
+            video,
+            &frames_raw,
+            &asr_part,
+            &visual_part,
+        )?;
         runner.emit_log(&id, format!("Raw audio: {}", raw_wav.display()));
         runner.emit_stage(&id, 2, 100);
         runner.emit_stage(&id, 3, 100);

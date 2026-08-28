@@ -77,6 +77,7 @@ impl Assets {
         self.filter_model_tar.exists()
     }
 
+    /// Reference voiceprint files. spk/ holds standard 16 kHz mono WAVs ready
     pub fn spk_refs(&self) -> Vec<PathBuf> {
         let mut out = Vec::new();
         if let Ok(rd) = std::fs::read_dir(&self.spk_dir) {
@@ -87,10 +88,7 @@ impl Assets {
                     .and_then(|e| e.to_str())
                     .unwrap_or("")
                     .to_lowercase();
-                if matches!(
-                    ext.as_str(),
-                    "mp4" | "mkv" | "mov" | "webm" | "avi" | "wav" | "mp3" | "m4a" | "flac" | "ogg"
-                ) {
+                if ext == "wav" {
                     out.push(p);
                 }
             }

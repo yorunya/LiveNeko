@@ -55,12 +55,6 @@ fn ensure_assets(app: &AppHandle) -> Result<Assets, String> {
             assets.filter_model_tar.display()
         ));
     }
-    if assets.spk_refs().is_empty() {
-        return Err(format!(
-            "no speaker reference media found in {}",
-            assets.spk_dir.display()
-        ));
-    }
     Ok(assets)
 }
 
@@ -190,7 +184,11 @@ pub fn get_os_theme(state: State<'_, AppState>) -> OsThemeInfo {
 }
 
 #[tauri::command]
-pub fn save_config(state: State<'_, AppState>, mut config: AppConfig) -> Result<(), String> {
+pub fn save_config(
+    state: State<'_, AppState>,
+    mut config: AppConfig,
+    speaker_wav: Option<String>,
+) -> Result<(), String> {
     // preserve backend-managed fields that the settings UI does not send
     let existing = state.config.lock().unwrap().clone();
     config.env_checked = existing.env_checked;
@@ -198,9 +196,158 @@ pub fn save_config(state: State<'_, AppState>, mut config: AppConfig) -> Result<
         config.python_cmd = existing.python_cmd.clone();
     }
     config.normalize();
+
+    // Speaker reference handling: the WAV is imported (16 kHz-checked, converted when needed) into <app_data>/spk/ at save time, so the file persists with the settings.
+    if config.speaker_name.is_empty() {
+        // speaker identification off — drop any stored reference
+        let _ = std::fs::remove_dir_all(state.app_data_dir.join("spk"));
+    } else if speaker_wav.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+        config.speaker_ref = import_speaker_wav(
+            &state,
+            speaker_wav.as_deref().unwrap(),
+            &config.speaker_name,
+        )?;
+    } else {
+        // keep the previously imported reference; it must still exist on disk
+        let wav = state
+            .app_data_dir
+            .join("spk")
+            .join(config.speaker_ref.trim());
+        if config.speaker_ref.trim().is_empty() || !wav.exists() {
+            return Err(format!(
+                "speaker \"{}\" needs a reference WAV file — choose one in Settings",
+                config.speaker_name
+            ));
+        }
+    }
+
     config.save(&state.app_data_dir)?;
     *state.config.lock().unwrap() = config;
     Ok(())
+}
+
+/// Directory holding the imported speaker reference WAV(s).
+fn speaker_dir(state: &AppState) -> std::path::PathBuf {
+    state.app_data_dir.join("spk")
+}
+
+/// Filesystem-safe stem derived from the speaker display name.
+fn sanitize_speaker_stem(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => ' ',
+            c if c.is_control() => ' ',
+            c => c,
+        })
+        .collect();
+    let trimmed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    let stem = if trimmed.is_empty() {
+        "speaker".to_string()
+    } else {
+        trimmed
+    };
+    stem.chars().take(60).collect()
+}
+
+/// Read the sample rate of `src` by parsing ffmpeg's stream info output
+/// ("... Audio: pcm_s16le, 16000 Hz, 1 channels ..."). ffmpeg prints that info to stderr and exits non-zero when no output file is given, which is fine for a header probe.
+fn probe_wav_sample_rate(src: &std::path::Path) -> Result<u32, String> {
+    use std::process::Command;
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-hide_banner", "-i"]).arg(src);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // no console window flash
+    }
+    let out = cmd.output().map_err(|e| format!("run ffmpeg: {e}"))?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for line in stderr.lines() {
+        let Some(audio) = line.find("Audio:") else {
+            continue;
+        };
+        let rest = &line[audio..];
+        let Some(hz) = rest.find("Hz") else { continue };
+        let digits: String = rest[..hz]
+            .chars()
+            .rev()
+            .skip_while(|c| c.is_whitespace())
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        if let Ok(rate) = digits.parse::<u32>() {
+            return Ok(rate);
+        }
+    }
+    Err(format!(
+        "could not read the audio stream info of {} — is it a valid media file?",
+        src.display()
+    ))
+}
+
+/// Import the user-provided reference WAV into <app_data>/spk/: verify with
+/// ffmpeg, convert to 16 kHz mono when needed, and keep exactly one reference
+/// file. Returns the stored filename (recorded in the config).
+fn import_speaker_wav(state: &AppState, src: &str, name: &str) -> Result<String, String> {
+    if run_capture("ffmpeg", &["-version"]).is_err() {
+        return Err(
+            "ffmpeg is required to import a speaker reference WAV but was not found".to_string(),
+        );
+    }
+    let src_path = std::path::Path::new(src);
+    if !src_path.exists() {
+        return Err(format!("reference WAV not found: {src}"));
+    }
+    let dir = speaker_dir(state);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+
+    let file_name = format!("{}.wav", sanitize_speaker_stem(name));
+    let target = dir.join(&file_name);
+
+    let rate = probe_wav_sample_rate(src_path)?;
+    if rate == 16000 {
+        // already 16 kHz — plain copy preserves the original audio bit-for-bit
+        std::fs::copy(src_path, &target)
+            .map_err(|e| format!("copy {}: {e}", src_path.display()))?;
+    } else {
+        // resample to 16 kHz mono so the spk model can consume it directly
+        run_capture(
+            "ffmpeg",
+            &[
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                src,
+                "-ar",
+                "16000",
+                "-ac",
+                "1",
+                "-vn",
+                target.to_str().ok_or("reference path is not valid UTF-8")?,
+            ],
+        )
+        .map_err(|e| format!("convert to 16 kHz: {e}"))?;
+    }
+
+    // keep exactly one reference file: remove leftovers from earlier speakers
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let is_wav = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("wav"));
+            if is_wav && p != target {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+    Ok(file_name)
 }
 
 /// Return the current effective summary prompt: the user's custom prompt if set, otherwise the bundled default prompt.md.
@@ -812,5 +959,61 @@ pub async fn test_api_connection(
         Ok(serde_json::json!({ "ok": true, "reply": reply }))
     } else {
         Err(format!("HTTP {status}: {text}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sanitize_speaker_stem() {
+        assert_eq!(sanitize_speaker_stem("taffy"), "taffy");
+        assert_eq!(sanitize_speaker_stem("  taffy  cat  "), "taffy cat");
+        assert_eq!(
+            sanitize_speaker_stem("a/b\\c:d*e?f\"g<h>i|j"),
+            "a b c d e f g h i j"
+        );
+        assert_eq!(sanitize_speaker_stem("///"), "speaker");
+        assert_eq!(sanitize_speaker_stem(""), "speaker");
+    }
+
+    #[test]
+    fn test_probe_wav_sample_rate() {
+        if std::process::Command::new("ffmpeg")
+            .args(["-version"])
+            .output()
+            .is_err()
+        {
+            // ffmpeg unavailable in this environment; nothing to verify against
+            return;
+        }
+        let dir = std::env::temp_dir().join("liveneko_probe_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        for rate in [16000u32, 48000] {
+            let wav = dir.join(format!("rate{rate}.wav"));
+            let status = std::process::Command::new("ffmpeg")
+                .args([
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=440:duration=1",
+                    "-ar",
+                    &rate.to_string(),
+                    "-ac",
+                    "1",
+                    wav.to_str().unwrap(),
+                ])
+                .status()
+                .unwrap();
+            assert!(status.success(), "ffmpeg failed to generate the test wav");
+            assert_eq!(probe_wav_sample_rate(&wav).unwrap(), rate);
+            let _ = std::fs::remove_file(&wav);
+        }
+        let _ = std::fs::remove_dir(&dir);
     }
 }

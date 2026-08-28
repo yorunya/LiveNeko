@@ -106,6 +106,21 @@
           </div>
 
           <div class="card">
+            <h2 data-i18n="settings.speakerTitle">Speaker identification</h2>
+            <p class="hint" data-i18n="settings.speakerHint">Optionally tag transcript lines with a specific speaker. Choose a short reference WAV clip of that speaker's voice (a few seconds of clean speech); it is converted to 16 kHz automatically if needed.</p>
+            <div class="row">
+              <label class="inline"><input type="checkbox" id="cfg-spk-enabled" /> <span data-i18n="settings.speakerEnable">Identify a specific speaker</span></label>
+            </div>
+            <div id="spk-settings" class="sub-card hidden">
+              <div class="row"><label class="wide"><span data-i18n="settings.speakerName">Speaker name</span> <input id="cfg-spk-name" type="text" data-i18n-placeholder="settings.speakerNamePlaceholder" placeholder="e.g. taffy" /></label></div>
+              <div class="row">
+                <button id="btn-browse-spk" class="btn" data-i18n="settings.speakerBrowse">Choose reference WAV…</button>
+                <span id="spk-file" class="hint"></span>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
             <h2 data-i18n="settings.qualityTitle">Video download quality</h2>
             <p class="hint" data-i18n="settings.qualityHint">Resolution used when downloading a video from a Bilibili URL (360P / 480P / 720P / 1080P). Lower is faster and smaller; default is 720P.</p>
             <div class="row">

@@ -12,10 +12,14 @@ using the ONNX `df` crate, so this worker only performs VAD/ASR/SPK.
 Protocol (newline-delimited JSON on stdin/stdout):
   Request:  {"cmd":"process","id":"<id>","input":"<filtered 16khz.wav>"}
   Response: {"cmd":"process","id":"<id>","ok":true,
-             "utterances":[[start_ms,end_ms,"taffy"|"other","<raw tagged text>"], ...]}
+             "utterances":[[start_ms,end_ms,"<speaker>"|"other","<raw tagged text>"], ...]}
             {"cmd":"process","id":"<id>","ok":false,"error":"..."}
   Shutdown: {"cmd":"shutdown"}
 Progress is emitted on stdout as {"progress":N} lines: 0..100 for the ASR phase.
+
+The reference dir (--ref-dir) is optional. When it is missing or empty the SPK
+model still loads, but utterances are not compared against any voiceprint and
+every speaker label is "other".
 """
 import argparse
 import concurrent.futures
@@ -34,7 +38,6 @@ from funasr import AutoModel
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-SPK_LABEL = "taffy"
 OTHER_LABEL = "other"
 SPK_THRESHOLD = 0.50
 SPK_CHUNK_S = 10.0
@@ -109,7 +112,7 @@ def _speaker_embeddings_matrix(chunks, long_idx, model):
     return np.stack(speaker_embeddings([chunks[j] for j in long_idx], model))
 
 
-def transcribe_samples(speech, segments, model, ref_matrix, on_progress=None):
+def transcribe_samples(speech, segments, model, ref_matrix, speaker_name, on_progress=None):
     log.info(f"VAD: {len(segments)} utterances")
     utterances = []
     total = max(len(segments), 1)
@@ -124,14 +127,14 @@ def transcribe_samples(speech, segments, model, ref_matrix, on_progress=None):
 
     def finalize(batch, long_idx, results, spk_emb):
         sims = {}
-        if spk_emb is not None:
+        if ref_matrix is not None and spk_emb is not None:
             sims = dict(zip(long_idx, np.max(ref_matrix @ spk_emb.T, axis=0)))
         for j, ((start_ms, end_ms), res) in enumerate(zip(batch, results)):
-            speaker = SPK_LABEL if sims.get(j, -1.0) > SPK_THRESHOLD else OTHER_LABEL
+            speaker = speaker_name if sims.get(j, -1.0) > SPK_THRESHOLD else OTHER_LABEL
             utterances.append([int(start_ms), int(end_ms), speaker, res["text"]])
 
     # Pipeline ASR (main thread) and SPK (worker thread): the SPK pass of batch i
-    # overlaps the ASR pass of batch i+1.
+    # overlaps the ASR pass of batch i+1. Without a reference voiceprint the SPK pass is skipped entirely.
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as spk_executor:
         pending = None
         for idx, (batch, chunks, long_idx) in enumerate(batches):
@@ -143,7 +146,7 @@ def transcribe_samples(speech, segments, model, ref_matrix, on_progress=None):
                 p_batch, p_long_idx, p_results, p_future = pending
                 spk_emb = p_future.result() if p_future is not None else None
                 finalize(p_batch, p_long_idx, p_results, spk_emb)
-            if long_idx:
+            if long_idx and ref_matrix is not None:
                 future = spk_executor.submit(_speaker_embeddings_matrix, chunks, long_idx, model)
             else:
                 future = None
@@ -159,7 +162,7 @@ def transcribe_samples(speech, segments, model, ref_matrix, on_progress=None):
     return utterances
 
 
-def process(req, model, ref_matrix):
+def process(req, model, ref_matrix, speaker_name):
     rid = req.get("id", "")
     input_wav = req.get("input", "")
     if not input_wav:
@@ -174,7 +177,7 @@ def process(req, model, ref_matrix):
         # ASR + speaker labelling: report 20..100 so the Rust backend keeps the
         # 0..20 range for DeepFilterNet denoising.
         utterances = transcribe_samples(
-            speech, segments, model, ref_matrix,
+            speech, segments, model, ref_matrix, speaker_name,
             on_progress=lambda p: progress(20 + p * 0.8),
         )
         send({"cmd": "process", "id": rid, "ok": True, "utterances": utterances})
@@ -187,8 +190,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model-dir", required=True,
                     help="dir containing SenseVoiceSmall/fsmn-vad/cam++")
-    ap.add_argument("--ref-dir", required=True,
-                    help="dir with standard 16 kHz mono reference wav files")
+    ap.add_argument("--ref-dir", default="",
+                    help="optional dir with 16 kHz mono reference wav files for speaker labelling")
+    ap.add_argument("--speaker-name", default="speaker",
+                    help="display name for the reference speaker in transcripts")
     args = ap.parse_args()
 
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -208,17 +213,20 @@ def main():
                 trust_remote_code=True
             )
 
-            ref_paths = sorted(glob.glob(os.path.join(args.ref_dir, "*.wav")))
-            if not ref_paths:
-                log.error(f"No reference wav files found in {args.ref_dir}/")
-                send({"cmd": "ready", "ok": False, "error": "no reference media"})
-                return
-            ref_matrix = np.stack([build_reference(p, model) for p in ref_paths])
+            # The SPK model always loads; a reference voiceprint is optional.
+            ref_paths = sorted(glob.glob(os.path.join(args.ref_dir, "*.wav"))) if args.ref_dir else []
+            if ref_paths:
+                ref_matrix = np.stack([build_reference(p, model) for p in ref_paths])
+            else:
+                ref_matrix = None
     except Exception as e:
         log.exception("model load failed")
         send({"cmd": "ready", "ok": False, "error": str(e)})
         return
-    log.info(f"Reference voiceprints: {len(ref_paths)} file(s)")
+    if ref_matrix is not None:
+        log.info(f"Reference voiceprints: {len(ref_paths)} file(s), speaker '{args.speaker_name}'")
+    else:
+        log.info("No speaker reference: utterances will not be tagged with a specific speaker")
 
     try:
         sys.stdin.reconfigure(encoding="utf-8")
@@ -241,7 +249,7 @@ def main():
             log.info("shutdown")
             break
         elif cmd == "process":
-            process(req, model, ref_matrix)
+            process(req, model, ref_matrix, args.speaker_name)
         else:
             send({"cmd": cmd, "id": req.get("id", ""), "ok": False,
                   "error": f"unknown cmd {cmd}"})

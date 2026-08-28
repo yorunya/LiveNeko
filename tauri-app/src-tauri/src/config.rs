@@ -16,6 +16,10 @@ pub struct AppConfig {
     pub download_quality: u32,
     /// Whether the environment check has already been run (persisted across launches).
     pub env_checked: bool,
+    /// Speaker display name used in transcripts (e.g. "taffy"). Empty = no speaker identification.
+    pub speaker_name: String,
+    /// Reference WAV filename (16 kHz mono) stored under <app_data>/spk/. Empty = none.
+    pub speaker_ref: String,
     /// UI language: "" (system default) | "en" | "zh".
     pub language: String,
     // OpenAI-compatible API
@@ -48,6 +52,8 @@ impl AppConfig {
             custom_prompt: String::new(),
             download_quality: 720,
             env_checked: false,
+            speaker_name: String::new(),
+            speaker_ref: String::new(),
             language: String::new(),
             api_base_url: "https://api.openai.com/v1".to_string(),
             api_key: String::new(),
@@ -77,6 +83,15 @@ impl AppConfig {
         }
         if !matches!(self.language.as_str(), "" | "en" | "zh") {
             self.language = String::new();
+        }
+        // Speaker: a name without a reference means no speaker identification;
+        // the name is a free-form display label, so only trim and cap its length.
+        self.speaker_name = self.speaker_name.trim().to_string();
+        if self.speaker_name.chars().count() > 60 {
+            self.speaker_name = self.speaker_name.chars().take(60).collect();
+        }
+        if self.speaker_name.is_empty() {
+            self.speaker_ref.clear();
         }
         if self.api_temperature == 0.0 {
             self.api_temperature = 0.4;

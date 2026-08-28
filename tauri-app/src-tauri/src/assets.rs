@@ -9,7 +9,6 @@ pub struct Assets {
     pub scripts_dir: PathBuf,
     pub audio_model_dir: PathBuf,
     pub filter_model_tar: PathBuf,
-    pub spk_dir: PathBuf,
 }
 
 impl Assets {
@@ -63,7 +62,6 @@ impl Assets {
             scripts_dir: pick("scripts"),
             audio_model_dir: pick("model"),
             filter_model_tar,
-            spk_dir: pick("spk"),
         }
     }
 
@@ -75,24 +73,5 @@ impl Assets {
 
     pub fn filter_model_present(&self) -> bool {
         self.filter_model_tar.exists()
-    }
-
-    /// Reference voiceprint files. spk/ holds standard 16 kHz mono WAVs ready
-    pub fn spk_refs(&self) -> Vec<PathBuf> {
-        let mut out = Vec::new();
-        if let Ok(rd) = std::fs::read_dir(&self.spk_dir) {
-            for entry in rd.flatten() {
-                let p = entry.path();
-                let ext = p
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("")
-                    .to_lowercase();
-                if ext == "wav" {
-                    out.push(p);
-                }
-            }
-        }
-        out
     }
 }

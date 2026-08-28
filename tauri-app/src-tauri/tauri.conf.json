@@ -35,7 +35,6 @@
     ],
     "resources": {
       "../../prompt.md": "prompt.md",
-      "../../spk": "spk",
       "../../model/SenseVoiceSmall/model.pt": "model/SenseVoiceSmall/model.pt",
       "../../model/SenseVoiceSmall/config.yaml": "model/SenseVoiceSmall/config.yaml",
       "../../model/SenseVoiceSmall/configuration.json": "model/SenseVoiceSmall/configuration.json",

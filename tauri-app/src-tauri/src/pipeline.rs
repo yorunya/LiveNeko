@@ -156,18 +156,32 @@ impl Runner {
         let pids = self.handle.model_pids.clone();
         let python = config.python_cmd.clone();
 
-        // The bundled spk/ references are already standard 16 kHz mono WAVs
-        if self.assets.spk_refs().is_empty() {
-            return Err("no speaker reference media found".to_string());
+        // The speaker reference is optional: when none is configured the SPK model still loads, but utterances are not tagged with a specific speaker.
+        let mut audio_args = vec![
+            "--model-dir".to_string(),
+            self.assets.audio_model_dir.display().to_string(),
+        ];
+        match self.speaker_reference(config)? {
+            Some((ref_dir, speaker_name)) => {
+                audio_args.push("--ref-dir".to_string());
+                audio_args.push(ref_dir.display().to_string());
+                audio_args.push("--speaker-name".to_string());
+                audio_args.push(speaker_name.clone());
+                self.emit_log(
+                    "pipeline",
+                    format!("[model] speaker identification: {speaker_name}"),
+                );
+            }
+            None => {
+                self.emit_log(
+                    "pipeline",
+                    "[model] no speaker configured: transcripts will not tag a specific speaker"
+                        .to_string(),
+                );
+            }
         }
 
         let audio_script = self.assets.scripts_dir.join("audio_server.py");
-        let audio_args = vec![
-            "--model-dir".to_string(),
-            self.assets.audio_model_dir.display().to_string(),
-            "--ref-dir".to_string(),
-            self.assets.spk_dir.display().to_string(),
-        ];
         self.emit_log(
             "pipeline",
             "[model] loading audio models (VAD/ASR/SPK)...".to_string(),
@@ -225,10 +239,28 @@ impl Runner {
         }
     }
 
-    /// Run, per part, in parallel:
-    /// audio thread: ffmpeg extract 48 kHz (video -> raw_wav) -> Rust denoise (raw_wav -> filtered_16k_wav) -> Python VAD/ASR/SPK -> raw utterances
-    /// visual thread: ffmpeg GPU decode (video -> frames_raw RGB blob) -> predict (frames_raw -> raw per-second labels)
-    /// The model workers only run inference; Rust extracts, denoises, and writes the per-part asr.txt/visual.txt files from the returned raw results.
+    /// Resolve the configured speaker reference: `(reference dir, display name)` when a speaker is configured and its imported WAV exists, `None` when no speaker is configured. Errors when a speaker is configured but the reference WAV went missing (the user should re-save it in Settings).
+    fn speaker_reference(&self, config: &AppConfig) -> Result<Option<(PathBuf, String)>, String> {
+        let name = config.speaker_name.trim();
+        if name.is_empty() {
+            return Ok(None);
+        }
+        let dir = self
+            .app
+            .path()
+            .app_data_dir()
+            .map_err(|e| format!("app data dir: {e}"))?
+            .join("spk");
+        let wav = dir.join(config.speaker_ref.trim());
+        if config.speaker_ref.trim().is_empty() || !wav.is_file() {
+            return Err(format!(
+                "speaker \"{name}\" is configured but its reference WAV is missing — open Settings and choose it again"
+            ));
+        }
+        Ok(Some((dir, name.to_string())))
+    }
+
+    /// Run, per part, in parallel: audio thread: ffmpeg extract 48 kHz (video -> raw_wav) -> Rust denoise (raw_wav -> filtered_16k_wav) -> Python VAD/ASR/SPK -> raw utterances visual thread: ffmpeg GPU decode (video -> frames_raw RGB blob) -> predict (frames_raw -> raw per-second labels) The model workers only run inference; Rust extracts, denoises, and writes the per-part asr.txt/visual.txt files from the returned raw results.
     pub fn run_audio_visual(
         &mut self,
         item_id: &str,
@@ -291,8 +323,7 @@ impl Runner {
                 {
                     let app2 = a_app.clone();
                     let id2 = a_id.clone();
-                    // Emit only when the percentage changes (0..20 => <=21 events). The denoiser reports once per hop; emitting each one flooded the
-                    // webview IPC and crashed the app.
+                    // Emit only when the percentage changes (0..20 => <=21 events). The denoiser reports once per hop; emitting each one flooded the webview IPC and crashed the app.
                     let last = Arc::new(Mutex::new(None::<u8>));
                     let mut denoiser = Denoiser::new(&a_filter_tar)?;
                     let progress_ctx = (app2, id2, last);

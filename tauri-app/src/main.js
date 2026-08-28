@@ -60,6 +60,8 @@ const state = {
   running: false,
   results: [],
   activeResult: null,
+  // freshly picked (not yet saved) speaker reference WAV source path
+  speakerWav: "",
 };
 
 // ---------- i18n ----------
@@ -121,6 +123,17 @@ const I18N = {
     "settings.videonekoHint": "Visual model directory (must contain config.json, model.safetensors, preprocessor_config.json).",
     "settings.videonekoPlaceholder": "Path to VideoNeko model directory",
     "settings.browse": "Browse…",
+    "settings.speakerTitle": "Speaker identification",
+    "settings.speakerHint": "Optionally tag transcript lines with a specific speaker. Choose a short reference WAV clip of that speaker's voice (a few seconds of clean speech); it is converted to 16 kHz automatically if needed.",
+    "settings.speakerEnable": "Identify a specific speaker",
+    "settings.speakerName": "Speaker name",
+    "settings.speakerNamePlaceholder": "e.g. taffy",
+    "settings.speakerBrowse": "Choose reference WAV…",
+    "settings.speakerFileCurrent": "Imported reference:",
+    "settings.speakerFileNew": "(new — saved with settings)",
+    "settings.speakerFileNone": "No reference WAV chosen.",
+    "settings.speakerNameRequired": "Enter a speaker name first.",
+    "settings.speakerWavRequired": "Choose a reference WAV file for this speaker.",
     "settings.qualityTitle": "Video download quality",
     "settings.qualityHint": "Resolution used when downloading a video from a Bilibili URL (360P / 480P / 720P / 1080P). Lower is faster and smaller; default is 720P.",
     "settings.engineTitle": "Summarization Engine",
@@ -253,6 +266,17 @@ const I18N = {
     "settings.videonekoHint": "视觉模型目录（需包含 config.json、model.safetensors、preprocessor_config.json）。",
     "settings.videonekoPlaceholder": "视觉模型目录路径",
     "settings.browse": "浏览…",
+    "settings.speakerTitle": "说话人识别",
+    "settings.speakerHint": "可选：在转写结果中用指定说话人标注语句。请提供该说话人声音的参考 WAV 片段（几秒清晰语音即可）；如不是 16 kHz 会自动转换。",
+    "settings.speakerEnable": "识别指定说话人",
+    "settings.speakerName": "说话人名称",
+    "settings.speakerNamePlaceholder": "例如 taffy",
+    "settings.speakerBrowse": "选择参考 WAV…",
+    "settings.speakerFileCurrent": "已导入参考：",
+    "settings.speakerFileNew": "（新选择，保存设置时导入）",
+    "settings.speakerFileNone": "尚未选择参考 WAV。",
+    "settings.speakerNameRequired": "请先填写说话人名称。",
+    "settings.speakerWavRequired": "请为该说话人选择参考 WAV 文件。",
     "settings.qualityTitle": "视频下载清晰度",
     "settings.qualityHint": "从链接下载视频时使用的分辨率（360P / 480P / 720P / 1080P）",
     "settings.engineTitle": "LLM引擎",
@@ -550,6 +574,7 @@ async function loadSettings() {
   $("#cfg-llamacpp-model").value = state.config.llamacppModel || "";
   $("#cfg-llamacpp-thinking").checked = !!state.config.llamacppThinking;
   $("#cfg-language").value = state.config.language || "";
+  setSpeakerSettings();
   setLanguage(state.config.language || "");
   setEngine(state.config.engine || "api");
   setQuality(state.config.downloadQuality || 720);
@@ -557,6 +582,25 @@ async function loadSettings() {
     $("#cfg-prompt").value = await invoke("get_prompt");
   } catch {
     $("#cfg-prompt").value = "";
+  }
+}
+
+function setSpeakerSettings() {
+  const enabled = !!(state.config.speakerName || "").trim();
+  $("#cfg-spk-enabled").checked = enabled;
+  $("#cfg-spk-name").value = enabled ? state.config.speakerName : "";
+  $("#spk-settings").classList.toggle("hidden", !enabled);
+  renderSpkFileStatus();
+}
+
+function renderSpkFileStatus() {
+  const el = $("#spk-file");
+  if (state.speakerWav) {
+    el.textContent = state.speakerWav.split(/[\\/]/).pop() + " " + t("settings.speakerFileNew");
+  } else if ((state.config?.speakerRef || "").trim()) {
+    el.textContent = t("settings.speakerFileCurrent") + " " + state.config.speakerRef;
+  } else {
+    el.textContent = t("settings.speakerFileNone");
   }
 }
 
@@ -579,12 +623,27 @@ function setQuality(quality) {
 async function saveSettings() {
   const engine = document.querySelector('input[name="engine"]:checked').value;
   const qualityInput = document.querySelector('input[name="quality"]:checked');
+  const spkEnabled = $("#cfg-spk-enabled").checked;
+  const spkName = spkEnabled ? $("#cfg-spk-name").value.trim() : "";
+  if (spkEnabled && !spkName) {
+    $("#save-status").textContent = t("settings.speakerNameRequired");
+    return;
+  }
+  // A speaker needs a reference WAV: either one picked in this session or the
+  // previously imported file (kept on the backend until the speaker changes).
+  if (spkEnabled && !state.speakerWav && !(state.config?.speakerRef || "").trim()) {
+    $("#save-status").textContent = t("settings.speakerWavRequired");
+    return;
+  }
   const config = {
     videonekoModelDir: $("#cfg-videoneko").value.trim(),
     engine,
     downloadQuality: qualityInput ? parseInt(qualityInput.value) || 720 : 720,
     language: $("#cfg-language").value,
     customPrompt: $("#cfg-prompt").value,
+    speakerName: spkName,
+    // keep the stored reference unless a new WAV was picked
+    speakerRef: spkEnabled && !state.speakerWav ? state.config?.speakerRef || "" : "",
     apiBaseUrl: $("#cfg-api-base").value.trim(),
     apiKey: $("#cfg-api-key").value.trim(),
     apiModel: $("#cfg-api-model").value.trim(),
@@ -600,8 +659,11 @@ async function saveSettings() {
     llamacppThinking: $("#cfg-llamacpp-thinking").checked,
   };
   try {
-    await invoke("save_config", { config });
-    state.config = config;
+    await invoke("save_config", { config, speakerWav: state.speakerWav || null });
+    state.speakerWav = "";
+    // re-fetch so backend-normalized fields (e.g. the stored reference name) show up
+    state.config = await invoke("get_config");
+    renderSpkFileStatus();
     $("#save-status").textContent = t("settings.saved");
     setTimeout(() => ($("#save-status").textContent = ""), 2000);
   } catch (e) {
@@ -892,6 +954,18 @@ function browseVideoneko() {
   open({ directory: true }).then((p) => { if (p) $("#cfg-videoneko").value = p; });
 }
 
+function browseSpeakerWav() {
+  open({
+    multiple: false,
+    filters: [{ name: "WAV audio", extensions: ["wav"] }],
+  }).then((p) => {
+    if (p) {
+      state.speakerWav = p;
+      renderSpkFileStatus();
+    }
+  });
+}
+
 async function testEngine(engine, statusEl) {
   let base, key, model;
   if (engine === "api") {
@@ -996,6 +1070,7 @@ function applyLanguage() {
   renderRunControls();
   renderQueue();
   renderEnv();
+  renderSpkFileStatus();
   renderResultsList();
   if (state.activeResult) openResult(state.activeResult.stem);
 }
@@ -1012,6 +1087,10 @@ function init() {
   $("#btn-clear").addEventListener("click", async () => { await invoke("clear_queue"); refreshQueue(); });
   $("#btn-recheck").addEventListener("click", () => refreshEnv(true));
   $("#btn-browse-videoneko").addEventListener("click", browseVideoneko);
+  $("#cfg-spk-enabled").addEventListener("change", () => {
+    $("#spk-settings").classList.toggle("hidden", !$("#cfg-spk-enabled").checked);
+  });
+  $("#btn-browse-spk").addEventListener("click", browseSpeakerWav);
   $("#btn-test-api").addEventListener("click", testApi);
   $("#btn-test-ollama").addEventListener("click", () => testEngine("ollama", $("#ollama-test-status")));
   $("#btn-test-llamacpp").addEventListener("click", () => testEngine("llamacpp", $("#llamacpp-test-status")));

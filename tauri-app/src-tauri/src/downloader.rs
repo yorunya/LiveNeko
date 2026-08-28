@@ -544,8 +544,19 @@ impl Downloader {
         Ok(BiliMeta { bvid, title, pages })
     }
 
-    /// Bilibili WBI signing (see `BilibiliBaseIE._sign_wbi`).
+    /// Bilibili WBI signing (see `BilibiliBaseIE._sign_wbi`). The key is cached for 30 s per session, matching yt-dlp's `_WBI_KEY_CACHE_TIMEOUT`.
     fn bilibili_wbi_key(&self) -> Result<String, String> {
+        use std::sync::Mutex;
+        use std::time::{Duration, Instant};
+        static CACHE: Mutex<Option<(String, Instant)>> = Mutex::new(None);
+        {
+            let guard = CACHE.lock().unwrap();
+            if let Some((key, ts)) = guard.as_ref() {
+                if ts.elapsed() < Duration::from_secs(30) {
+                    return Ok(key.clone());
+                }
+            }
+        }
         let nav = self.http.get_json(
             "https://api.bilibili.com/x/web-interface/nav",
             &[("Referer", "https://www.bilibili.com/")],
@@ -583,9 +594,84 @@ impl Downloader {
             .filter_map(|&i| lookup.chars().nth(i))
             .take(32)
             .collect();
+        *CACHE.lock().unwrap() = Some((key.clone(), Instant::now()));
         Ok(key)
     }
 
+    /// Randomised danmaku/fingerprint params that Bilibili expects on playurl
+    /// requests (mirrors `BilibiliBaseIE._dm_params`). Sending these materially
+    /// reduces `-352` risk-control rejections on unauthenticated requests.
+    fn bilibili_dm_params(&self) -> Vec<(String, String)> {
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u32 {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (self.0 >> 33) as u32
+            }
+        }
+        let mut rng = Rng(0x9E3779B97F4A7C15
+            ^ (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0) as u64));
+
+        const ALPHA: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        fn pad(rng: &mut Rng, n: usize) -> String {
+            let mut v = String::new();
+            for _ in 0..n {
+                v.push(ALPHA[(rng.next() as usize) % 64] as char);
+            }
+            v
+        }
+        let dm_img_str = {
+            let n = rng.next();
+            let s = pad(&mut rng, 16 + (n as usize) % 49);
+            s[..s.len() - 2].to_string()
+        };
+        let dm_cover_img_str = {
+            let n = rng.next();
+            let s = pad(&mut rng, 32 + (n as usize) % 97);
+            s[..s.len() - 2].to_string()
+        };
+        let (w, h) = match rng.next() % 18 {
+            0..=2 => (1920i64, 1080i64),
+            3..=5 => (1366, 768),
+            6..=7 => (1536, 864),
+            8 => (1280, 720),
+            9 => (2560, 1440),
+            10..=11 => (1440, 900),
+            _ => (1600, 900),
+        };
+        let rnd_wh = (rng.next() % 114) as i64;
+        let wh = format!(
+            "[{}, {}, {}]",
+            2 * w + 2 * h + 3 * rnd_wh,
+            4 * w - h + rnd_wh,
+            rnd_wh
+        );
+        let scroll_top = (rng.next() % 101) as i64;
+        let rnd_of = (rng.next() % 514) as i64;
+        let of = format!(
+            "[{}, {}, {}]",
+            3 * scroll_top + 2 * 10 + rnd_of,
+            4 * scroll_top - 4 * 10 + 2 * rnd_of,
+            rnd_of
+        );
+        vec![
+            ("dm_img_list".to_string(), "[]".to_string()),
+            ("dm_img_str".to_string(), dm_img_str),
+            ("dm_cover_img_str".to_string(), dm_cover_img_str),
+            (
+                "dm_img_inter".to_string(),
+                format!("{{\"ds\":[],\"wh\":{wh},\"of\":{of}}}"),
+            ),
+        ]
+    }
+
+    /// Fetch the playurl (DASH formats) for one cid, WBI-signed and carrying the danmaku fingerprint params, exactly as yt-dlp's `_download_playinfo` does for an unauthenticated session (`try_look=1`, `fnval=4048`).
     fn bilibili_playurl(&self, bvid: &str, cid: u64) -> Result<Value, String> {
         let wbi_key = self.bilibili_wbi_key()?;
         let wts = SystemTime::now()
@@ -601,6 +687,10 @@ impl Downloader {
         ]
         .into_iter()
         .collect();
+        // yt-dlp only drops `try_look` when logged in; unauthenticated keeps it.
+        for (k, v) in self.bilibili_dm_params() {
+            params.insert(k, v);
+        }
         // Remove chars that must be stripped
         let mut sorted: Vec<(String, String)> = params
             .iter()

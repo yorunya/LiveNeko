@@ -3,16 +3,15 @@ use df::transforms::resample;
 use df::wav_utils::{ReadWav, write_wav_arr2};
 use ndarray::{Array2, ArrayD, Axis};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const TARGET_SR: usize = 16000;
 const ATTEN_LIM_DB: f32 = 18.0;
 
 /// Owned DeepFilterNet denoiser backed by the Rust `df` crate.
 ///
-/// Loads the ONNX model once and can process multiple input files. The model
-/// is not `Sync`, so the caller must provide mutable access during inference.
+/// Loads the ONNX model once and can process multiple input files. The model is not `Sync`, so the caller must provide mutable access during inference.
 pub struct Denoiser {
     model: DfTract,
 }
@@ -28,11 +27,9 @@ impl Denoiser {
         Ok(Self { model })
     }
 
-    /// Denoise a 48 kHz (or any sample rate) mono WAV and write the enhanced
-    /// audio to `output_wav` at 16 kHz.
+    /// Denoise a 48 kHz (or any sample rate) mono WAV and write the enhanced audio to `output_wav` at 16 kHz.
     ///
-    /// Progress is reported as 0..20 so the caller can reserve the 20..100
-    /// range for downstream ASR. Returns `Err("cancelled")` if `cancel` is set.
+    /// Progress is reported as 0..20 so the caller can reserve the 20..100 range for downstream ASR. Returns `Err("cancelled")` if `cancel` is set.
     pub fn process_file<P: AsRef<Path>, Q: AsRef<Path>>(
         &mut self,
         input_wav: P,
@@ -73,8 +70,7 @@ impl Denoiser {
                 return Err("cancelled".to_string());
             }
             if ns_f.len_of(Axis(1)) < hop {
-                // Leave the trailing partial hop unprocessed, matching the
-                // upstream `deep-filter` CLI behavior.
+                // Leave the trailing partial hop unprocessed, matching the upstream `deep-filter` CLI behavior.
                 break;
             }
             self.model

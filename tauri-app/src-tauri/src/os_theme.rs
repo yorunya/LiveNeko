@@ -1,34 +1,24 @@
-//! OS appearance detection: light/dark theme plus the accent color where the OS
-//! exposes it. Everything here runs exactly once at application startup; there
-//! is deliberately no runtime theme-change listener anywhere in the app.
+//! OS appearance detection: light/dark theme plus the accent color where the OS exposes it. Everything here runs exactly once at application startup
 
 use tauri::{App, Manager};
 
-/// Current OS light/dark theme via the official Tauri window API, which itself
-/// uses the official platform methods (Windows apps-use-light-theme setting,
-/// macOS NSAppearance, Linux GTK/freedesktop settings). The window has no
-/// explicit `theme` set in tauri.conf.json, so this reports the system theme.
+/// Current OS light/dark theme via the official Tauri window API
 pub fn detect_theme(app: &App) -> &'static str {
-    match app
-        .get_webview_window("main")
-        .and_then(|w| w.theme().ok())
-    {
+    match app.get_webview_window("main").and_then(|w| w.theme().ok()) {
         Some(tauri::Theme::Dark) => "dark",
         _ => "light",
     }
 }
 
-/// OS accent color as "#rrggbb" when the platform exposes it, read via the
-/// official OS settings interfaces. `None` means "no accent exposed" and the UI
-/// keeps its built-in default accent.
+/// OS accent color as "#rrggbb" when the platform exposes it, read via the official OS settings interfaces
 pub fn detect_accent_color() -> Option<String> {
     platform_accent_color()
 }
 
 #[cfg(target_os = "windows")]
 fn platform_accent_color() -> Option<String> {
-    use winreg::enums::HKEY_CURRENT_USER;
     use winreg::RegKey;
+    use winreg::enums::HKEY_CURRENT_USER;
     // Official per-user accent color: HKCU\Software\Microsoft\Windows\DWM\AccentColor
     // (DWORD in ABGR byte order).
     let dwm = RegKey::predef(HKEY_CURRENT_USER)

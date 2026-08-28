@@ -2,6 +2,7 @@ mod assets;
 mod commands;
 mod config;
 mod df_denoise;
+mod downloader;
 mod model_ipc;
 mod os_theme;
 mod pipeline;

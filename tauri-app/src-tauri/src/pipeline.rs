@@ -11,24 +11,13 @@ use tauri::{AppHandle, Emitter, Manager};
 
 /// Prevent a console window from flashing up when spawning subprocesses from a GUI app.
 #[cfg(windows)]
-fn hide_console(cmd: &mut Command) {
+pub(crate) fn hide_console(cmd: &mut Command) {
     use std::os::windows::process::CommandExt;
     cmd.creation_flags(0x08000000);
 }
 
 #[cfg(not(windows))]
-fn hide_console(_cmd: &mut Command) {}
-
-/// Decode bytes captured from a child process stdout. Native console apps on Windows (e.g. yt-dlp) emit non-ASCII text using the system ANSI codepage (GBK on zh-CN) instead of UTF-8, which breaks UTF-8 line decoding. Try UTF-8 first, then fall back to GBK.
-fn decode_console_text(bytes: &[u8]) -> String {
-    match std::str::from_utf8(bytes) {
-        Ok(s) => s.to_string(),
-        Err(_) => {
-            let (text, _, _) = encoding_rs::GBK.decode(bytes);
-            text.into_owned()
-        }
-    }
-}
+pub(crate) fn hide_console(_cmd: &mut Command) {}
 
 /// Resolve once the cancel flag is set (polled so it can race an in-flight async request via `tokio::select!`).
 async fn cancel_signal(cancel: &Arc<AtomicBool>) {
@@ -514,85 +503,33 @@ impl Runner {
         Ok(status.success())
     }
 
-    /// Like run_process, but returns the collected stdout lines (for probing commands like `yt-dlp --print`).
-    fn run_process_capture(
-        &self,
-        item_id: &str,
-        program: &Path,
-        args: &[String],
-        cwd: Option<&Path>,
-    ) -> Result<Vec<String>, String> {
-        let mut cmd = Command::new(program);
-        cmd.args(args);
-        if let Some(dir) = cwd {
-            cmd.current_dir(dir);
-        }
-        hide_console(&mut cmd);
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut child = cmd.spawn().map_err(|e| format!("spawn failed: {e}"))?;
-        let stdout = child.stdout.take().expect("stdout piped");
-        let stderr = child.stderr.take().expect("stderr piped");
-        *self.handle.child.lock().unwrap() = Some(child);
-
-        let stderr_app = self.app.clone();
-        let item_id3 = item_id.to_string();
-        let log_file = self.handle.log_file.clone();
-        let stderr_handle = std::thread::spawn(move || {
-            use std::io::BufRead;
-            let reader = std::io::BufReader::new(stderr);
-            for line in reader.lines() {
-                if let Ok(l) = line {
-                    log_line(&stderr_app, &log_file, &item_id3, &l);
-                }
-            }
-        });
-
-        use std::io::BufRead;
-        let mut reader = std::io::BufReader::new(stdout);
-        let mut lines = Vec::new();
-        let mut raw = Vec::new();
-        loop {
-            raw.clear();
-            let n = reader
-                .read_until(b'\n', &mut raw)
-                .map_err(|e| format!("read stdout: {e}"))?;
-            if n == 0 {
-                break;
-            }
-            let line = decode_console_text(&raw);
-            let trimmed = line.trim();
-            if let Some(rest) = trimmed.strip_prefix("PROGRESS ") {
-                if let Ok(p) = rest.parse::<u8>() {
-                    self.emit_stage(item_id, self.current_stage, p.min(100));
-                }
-            } else if !trimmed.is_empty() {
-                lines.push(line);
-            }
-        }
-
-        let status = self
-            .handle
-            .child
-            .lock()
-            .unwrap()
-            .take()
-            .map(|mut c| c.wait())
-            .unwrap_or_else(|| Err(std::io::Error::new(std::io::ErrorKind::Other, "no child")));
-        let status = status.map_err(|e| format!("wait failed: {e}"))?;
-        let _ = stderr_handle.join();
-
-        let cancelled = self.is_cancelled();
-        if cancelled {
-            return Err("cancelled".to_string());
-        }
-        if !status.success() {
-            return Err(format!(
-                "{} exited with code {:?}",
-                program.display(),
-                status.code()
-            ));
-        }
-        Ok(lines)
+    /// Build a downloader for this item, wiring progress and logs to the UI.
+    fn make_downloader(&self, item_id: &str) -> crate::downloader::Downloader {
+        let cancel = self.handle.cancel.clone();
+        let stage = self.current_stage;
+        let app = self.app.clone();
+        let item_id_owned = item_id.to_string();
+        let on_progress = Arc::new(Mutex::new(Box::new(move |p: u8| {
+            let _ = app.emit(
+                "pipeline://stage",
+                serde_json::json!({
+                    "itemId": item_id_owned,
+                    "stage": stage,
+                    "progress": p.min(100),
+                    "part": 1,
+                    "totalParts": 1,
+                }),
+            );
+        })
+            as Box<dyn FnMut(u8) + Send>));
+        let app2 = self.app.clone();
+        let item_id2 = item_id.to_string();
+        let log_file2 = self.handle.log_file.clone();
+        let on_log = Arc::new(Mutex::new(Box::new(move |line: String| {
+            log_line(&app2, &log_file2, &item_id2, &line);
+        })
+            as Box<dyn FnMut(String) + Send>));
+        crate::downloader::Downloader::new(cancel, on_progress, on_log)
     }
 
     fn run_ytdlp(
@@ -602,44 +539,29 @@ impl Runner {
         out_dir: &Path,
         quality: u32,
     ) -> Result<bool, String> {
-        self.emit_log(item_id, format!("[yt-dlp] downloading {url}"));
-        let mut args = vec![
-            "--merge-output-format".to_string(),
-            "mp4".to_string(),
-            "-f".to_string(),
-            quality_format(quality),
-        ];
-        args.push("-P".to_string());
-        args.push(out_dir.display().to_string());
-        args.push("-o".to_string());
-        args.push("%(title).100B [%(id)s].%(ext)s".to_string());
-        args.push(url.to_string());
-        let r = self.run_process(item_id, &self.assets.yt_dlp_exe, &args, None);
-        match &r {
-            Ok(true) => self.emit_log(item_id, "[yt-dlp] download complete".to_string()),
-            Ok(false) => self.emit_log(item_id, "[yt-dlp] download failed".to_string()),
-            Err(_) => {}
-        }
-        r
+        self.emit_log(item_id, format!("[downloader] downloading {url}"));
+        let dl = self.make_downloader(item_id);
+        let files = dl.download(url, out_dir, quality)?;
+        self.emit_log(
+            item_id,
+            format!("[downloader] download complete ({} file(s))", files.len()),
+        );
+        Ok(true)
     }
 
-    /// List the video titles a URL yields, one per line (used to detect multi-video / multi-part pages). Runs `yt-dlp --print %(title)s`.
+    /// List the video titles a URL yields, one per line (used to detect multi-video / multi-part pages).
     fn ytdlp_list_titles(&self, item_id: &str, url: &str) -> Result<Vec<String>, String> {
-        self.emit_log(item_id, format!("[yt-dlp] listing titles: {url}"));
-        let args = vec![
-            "--print".to_string(),
-            "%(title)s".to_string(),
-            url.to_string(),
-        ];
-        let lines = self.run_process_capture(item_id, &self.assets.yt_dlp_exe, &args, None)?;
-        Ok(lines
-            .iter()
+        self.emit_log(item_id, format!("[downloader] listing titles: {url}"));
+        let dl = self.make_downloader(item_id);
+        let titles = dl.probe_titles(url)?;
+        Ok(titles
+            .into_iter()
             .map(|l| l.trim().to_string())
             .filter(|l| !l.is_empty())
             .collect())
     }
 
-    /// Download ALL videos from a URL (`--yes-playlist`) into out_dir, preserving playlist order in the filenames and merging each part's video/audio streams into a single file.
+    /// Download ALL videos from a URL into out_dir, preserving playlist order in the filenames and merging each part's video/audio streams into a single file.
     fn ytdlp_download_playlist(
         &self,
         item_id: &str,
@@ -647,26 +569,14 @@ impl Runner {
         out_dir: &Path,
         quality: u32,
     ) -> Result<bool, String> {
-        self.emit_log(item_id, format!("[yt-dlp] downloading all videos: {url}"));
-        let mut args = vec![
-            "--yes-playlist".to_string(),
-            "--merge-output-format".to_string(),
-            "mp4".to_string(),
-            "-f".to_string(),
-            quality_format(quality),
-        ];
-        args.push("-P".to_string());
-        args.push(out_dir.display().to_string());
-        args.push("-o".to_string());
-        args.push("%(playlist_index)03d_%(title).100B [%(id)s].%(ext)s".to_string());
-        args.push(url.to_string());
-        let r = self.run_process(item_id, &self.assets.yt_dlp_exe, &args, None);
-        match &r {
-            Ok(true) => self.emit_log(item_id, "[yt-dlp] download complete".to_string()),
-            Ok(false) => self.emit_log(item_id, "[yt-dlp] download failed".to_string()),
-            Err(_) => {}
-        }
-        r
+        self.emit_log(item_id, format!("[downloader] downloading all videos: {url}"));
+        let dl = self.make_downloader(item_id);
+        let files = dl.download(url, out_dir, quality)?;
+        self.emit_log(
+            item_id,
+            format!("[downloader] download complete ({} file(s))", files.len()),
+        );
+        Ok(true)
     }
 
     /// Duration of a media file in whole seconds (via ffprobe).
@@ -1060,19 +970,17 @@ pub fn simplify_title_str(raw: &str) -> String {
     trimmed.to_string()
 }
 
-/// Probe the video title(s) a URL yields with `yt-dlp --print %(title)s`. Used to show the real title in the queue immediately when a URL is added.
-pub fn probe_ytdlp_titles(yt_dlp_exe: &Path, url: &str) -> Result<Vec<String>, String> {
-    let mut cmd = std::process::Command::new(yt_dlp_exe);
-    cmd.args(["--print", "%(title)s", url]);
-    hide_console(&mut cmd);
-    let out = cmd.output().map_err(|e| format!("run yt-dlp: {e}"))?;
-    if !out.status.success() {
-        let msg = String::from_utf8_lossy(&out.stderr);
-        return Err(format!("yt-dlp failed: {}", msg.trim()));
-    }
-    let text = decode_console_text(&out.stdout);
-    Ok(text
-        .lines()
+/// Probe the video title(s) a URL yields. Used to show the real title in the queue immediately when a URL is added.
+/// `yt_dlp_exe` is kept for API compatibility but is no longer used; titles are
+/// fetched in-process via `crate::downloader`.
+pub fn probe_ytdlp_titles(_yt_dlp_exe: &Path, url: &str) -> Result<Vec<String>, String> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let on_progress = Arc::new(Mutex::new(Box::new(|_: u8| {}) as Box<dyn FnMut(u8) + Send>));
+    let on_log = Arc::new(Mutex::new(Box::new(|_: String| {}) as Box<dyn FnMut(String) + Send>));
+    let dl = crate::downloader::Downloader::new(cancel, on_progress, on_log);
+    let titles = dl.probe_titles(url)?;
+    Ok(titles
+        .into_iter()
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty())
         .collect())
@@ -1086,17 +994,6 @@ fn sanitize_filename(name: &str) -> String {
             c => c,
         })
         .collect()
-}
-
-/// The yt-dlp `-f` selector for the requested download quality.
-fn quality_format(quality: u32) -> String {
-    let q = match quality {
-        360 => 360,
-        480 => 480,
-        1080 => 1080,
-        _ => 720,
-    };
-    format!("bestvideo[height<={q}]+bestaudio/best[height<={q}]")
 }
 
 fn parse_hms(s: &str) -> Option<u64> {

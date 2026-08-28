@@ -1,6 +1,6 @@
 [package]
 name = "liveneko"
-version = "0.1.1"
+version = "0.1.2"
 description = "LiveNeko multi-modal video summarization desktop app"
 authors = ["LiveNeko"]
 edition = "2024"
@@ -23,6 +23,7 @@ openai-rust2 = "1.7.6"
 encoding_rs = "0.8.35"
 regex = "1.13.1"
 ndarray = "0.16"
+url = "2.5"
 deep_filter = { path = "../../DeepFilterNet/libDF", features = ["tract", "wav-utils", "transforms"] }
 
 [target.'cfg(windows)'.dependencies]

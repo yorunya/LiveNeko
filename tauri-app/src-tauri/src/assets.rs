@@ -44,7 +44,6 @@ impl Assets {
         };
 
         // The ONNX DeepFilterNet model is bundled as model/DeepFilterNet3_onnx.tar.gz
-        // but lives under DeepFilterNet/models/ in the source repo.
         let filter_model_tar = {
             let candidates = [
                 resource.join("model/DeepFilterNet3_onnx.tar.gz"),

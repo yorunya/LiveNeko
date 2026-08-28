@@ -3,8 +3,8 @@ use crate::config::AppConfig;
 use crate::model_ipc::log_line;
 use crate::pipeline::{self, ItemStatus, PipelineHandle, QueueItem, Runner};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
@@ -16,12 +16,8 @@ pub struct AppState {
     /// Legacy-result migration is idempotent; run it once per process.
     pub migrated: AtomicBool,
     pub app_data_dir: PathBuf,
-    /// OS appearance ("light" | "dark"), detected once at startup via the official
-    /// Tauri window API (which uses the platform methods: Windows apps theme,
-    /// macOS NSAppearance, Linux GTK/freedesktop). Never re-polled afterwards.
+    /// OS appearance ("light" | "dark"), detected once at startup
     pub os_theme: String,
-    /// OS accent color as "#rrggbb" where the OS exposes it (Windows DWM
-    /// registry, GNOME gsettings, macOS defaults), detected once at startup.
     pub os_accent: Option<String>,
 }
 
@@ -46,12 +42,7 @@ fn emit_app(app: &AppHandle, event: &str, payload: serde_json::Value) {
 
 fn ensure_assets(app: &AppHandle) -> Result<Assets, String> {
     let assets = Assets::resolve(app);
-    if !assets.yt_dlp_exe.exists() {
-        return Err(format!(
-            "yt-dlp.exe not found at {}",
-            assets.yt_dlp_exe.display()
-        ));
-    }
+    // via crate::downloader using the same unauthenticated Bilibili/YouTube APIs.
     if !assets.audio_models_present() {
         return Err(format!(
             "bundled audio models missing under {}",
@@ -80,7 +71,7 @@ pub fn check_environment(
     state: State<'_, AppState>,
     force: Option<bool>,
 ) -> Result<serde_json::Value, String> {
-    // Environment check runs only once per machine unless forced (Re-check button). Persist the result so the second launch onwards skips the slow python/asset probing.
+    // Environment check runs only once per machine unless forced (Re-check button).
     let env_report_path = state.app_data_dir.join("env_report.json");
     let mut cfg = state.config.lock().unwrap().clone();
     if !force.unwrap_or(false) && cfg.env_checked && env_report_path.exists() {
@@ -102,12 +93,9 @@ pub fn check_environment(
 fn run_environment_check(app: &AppHandle, cfg: &AppConfig) -> serde_json::Value {
     let assets = Assets::resolve(app);
 
-    // Python check
     let python_check = run_capture(&cfg.python_cmd, &["--version"]);
     let python_ok = python_check.is_ok();
     let python_version = python_check.unwrap_or_default();
-
-    // ffmpeg check
     let ffmpeg_ok = run_capture("ffmpeg", &["-version"]).is_ok();
 
     // Python libraries check
@@ -185,13 +173,11 @@ pub fn get_config(state: State<'_, AppState>) -> AppConfig {
     state.config.lock().unwrap().clone()
 }
 
-/// OS appearance captured once at startup. The app always follows the OS theme;
-/// there is intentionally no custom/user-selectable theme option.
+/// OS appearance captured once at startup.
 #[derive(serde::Serialize)]
 pub struct OsThemeInfo {
     /// "light" | "dark"
     pub theme: String,
-    /// OS accent color as "#rrggbb", when the platform exposes one.
     pub accent: Option<String>,
 }
 
@@ -340,8 +326,7 @@ pub fn start_pipeline(app: AppHandle, state: State<'_, AppState>) -> Result<(), 
     // reset cancellation for this run
     state.pipeline.cancel.store(false, Ordering::SeqCst);
 
-    // Open the run log file (work/pipeline.log); all pipeline log lines are
-    // appended to it alongside being emitted to the UI.
+    // Open the run log file (work/pipeline.log);
     let work_root = state.app_data_dir.join("work");
     let _ = std::fs::create_dir_all(&work_root);
     if let Ok(f) = std::fs::OpenOptions::new()

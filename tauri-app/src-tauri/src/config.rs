@@ -70,7 +70,6 @@ impl AppConfig {
     }
 
     /// Normalize/migrate field values so they always hold valid defaults
-    /// (covers configs saved before new fields were added).
     pub fn normalize(&mut self) {
         if self.engine.is_empty() || !matches!(self.engine.as_str(), "api" | "ollama" | "llamacpp")
         {

@@ -65,18 +65,27 @@ def quiet_stdout():
 
 
 # ---- VAD / ASR / speaker ----
+#
+# All three sub-models are built by a single AutoModel(...) call (see main()).
+# The returned object exposes the raw sub-modules as `.vad_model`, `.model`
+# (ASR) and `.spk_model` plus their resolved configs `.vad_kwargs`, `.kwargs`
+# and `.spk_kwargs`. We call them individually through the unified model's
+# `inference(...)` helper, which runs the same data-iterator + batching path a
+# standalone AutoModel.generate() would, so downstream behavior is unchanged.
 
 
-def load_speech(wav_path, vad_model):
+def load_speech(wav_path, model):
     speech, sr = sf.read(wav_path, dtype="float32")
     if sr != SAMPLE_RATE:
         raise RuntimeError(f"Unexpected sample rate {sr} for {wav_path}; expected {SAMPLE_RATE}")
-    segments = vad_model.generate(input=speech, fs=SAMPLE_RATE)[0]["value"]
+    segments = model.inference(
+        input=speech, model=model.vad_model, kwargs=model.vad_kwargs, fs=SAMPLE_RATE
+    )[0]["value"]
     return speech, segments
 
 
-def speaker_embeddings(chunks, spk_model):
-    results = spk_model.generate(input=chunks)
+def speaker_embeddings(chunks, model):
+    results = model.inference(input=chunks, model=model.spk_model, kwargs=model.spk_kwargs)
     embeddings = []
     for res in results:
         e = res["spk_embedding"]
@@ -87,8 +96,8 @@ def speaker_embeddings(chunks, spk_model):
     return embeddings
 
 
-def build_reference(wav_path, vad_model, spk_model):
-    speech, segments = load_speech(wav_path, vad_model)
+def build_reference(wav_path, model):
+    speech, segments = load_speech(wav_path, model)
     chunks = []
     step = SPK_CHUNK_SAMPLES
     for start_ms, end_ms in segments:
@@ -99,16 +108,16 @@ def build_reference(wav_path, vad_model, spk_model):
                 chunks.append(chunk)
     if not chunks:
         raise RuntimeError(f"No speech found in reference {wav_path}")
-    ref = np.mean(speaker_embeddings(chunks, spk_model), axis=0)
+    ref = np.mean(speaker_embeddings(chunks, model), axis=0)
     ref /= np.linalg.norm(ref)
     return ref
 
 
-def _speaker_embeddings_matrix(chunks, long_idx, spk_model):
-    return np.stack(speaker_embeddings([chunks[j] for j in long_idx], spk_model))
+def _speaker_embeddings_matrix(chunks, long_idx, model):
+    return np.stack(speaker_embeddings([chunks[j] for j in long_idx], model))
 
 
-def transcribe_samples(speech, segments, asr_model, spk_model, ref_matrix, on_progress=None):
+def transcribe_samples(speech, segments, model, ref_matrix, on_progress=None):
     log.info(f"VAD: {len(segments)} utterances")
     utterances = []
     total = max(len(segments), 1)
@@ -134,15 +143,16 @@ def transcribe_samples(speech, segments, asr_model, spk_model, ref_matrix, on_pr
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as spk_executor:
         pending = None
         for idx, (batch, chunks, long_idx) in enumerate(batches):
-            results = asr_model.generate(
-                input=chunks, language="zh", use_itn=True, batch_size_s=ASR_BATCH_SIZE_S
+            results = model.inference(
+                input=chunks, model=model.model, kwargs=model.kwargs,
+                language="zh", use_itn=True, batch_size_s=ASR_BATCH_SIZE_S,
             )
             if pending is not None:
                 p_batch, p_long_idx, p_results, p_future = pending
                 spk_emb = p_future.result() if p_future is not None else None
                 finalize(p_batch, p_long_idx, p_results, spk_emb)
             if long_idx:
-                future = spk_executor.submit(_speaker_embeddings_matrix, chunks, long_idx, spk_model)
+                future = spk_executor.submit(_speaker_embeddings_matrix, chunks, long_idx, model)
             else:
                 future = None
             pending = (batch, long_idx, results, future)
@@ -157,7 +167,7 @@ def transcribe_samples(speech, segments, asr_model, spk_model, ref_matrix, on_pr
     return utterances
 
 
-def process(req, vad_model, asr_model, spk_model, ref_matrix):
+def process(req, model, ref_matrix):
     rid = req.get("id", "")
     input_wav = req.get("input", "")
     if not input_wav:
@@ -168,11 +178,11 @@ def process(req, vad_model, asr_model, spk_model, ref_matrix):
             send({"progress": int(n)})
 
         # VAD on the 16 kHz filtered audio.
-        speech, segments = load_speech(input_wav, vad_model)
+        speech, segments = load_speech(input_wav, model)
         # ASR + speaker labelling: report 20..100 so the Rust backend keeps the
         # 0..20 range for DeepFilterNet denoising.
         utterances = transcribe_samples(
-            speech, segments, asr_model, spk_model, ref_matrix,
+            speech, segments, model, ref_matrix,
             on_progress=lambda p: progress(20 + p * 0.8),
         )
         send({"cmd": "process", "id": rid, "ok": True, "utterances": utterances})
@@ -195,19 +205,24 @@ def main():
     log.info("Loading models...")
     try:
         with quiet_stdout():
-            vad_model = AutoModel(model=os.path.join(args.model_dir, "fsmn-vad"),
-                                  device=device, disable_update=True, disable_pbar=True)
-            asr_model = AutoModel(model=os.path.join(args.model_dir, "SenseVoiceSmall"),
-                                  device=device, disable_update=True, disable_pbar=True)
-            spk_model = AutoModel(model=os.path.join(args.model_dir, "cam++"),
-                                  device=device, disable_update=True, disable_pbar=True)
+            # One AutoModel call builds the ASR model plus the VAD and speaker
+            # sub-models; the same paths/config as before, just unified.
+            model = AutoModel(
+                model=os.path.join(args.model_dir, "SenseVoiceSmall"),
+                vad_model=os.path.join(args.model_dir, "fsmn-vad"),
+                spk_model=os.path.join(args.model_dir, "cam++"),
+                device=device,
+                disable_update=True,
+                disable_pbar=True,
+                trust_remote_code=True
+            )
 
             ref_paths = sorted(glob.glob(os.path.join(args.ref_dir, "*.wav")))
             if not ref_paths:
                 log.error(f"No reference wav files found in {args.ref_dir}/")
                 send({"cmd": "ready", "ok": False, "error": "no reference media"})
                 return
-            ref_matrix = np.stack([build_reference(p, vad_model, spk_model) for p in ref_paths])
+            ref_matrix = np.stack([build_reference(p, model) for p in ref_paths])
     except Exception as e:
         log.exception("model load failed")
         send({"cmd": "ready", "ok": False, "error": str(e)})
@@ -235,7 +250,7 @@ def main():
             log.info("shutdown")
             break
         elif cmd == "process":
-            process(req, vad_model, asr_model, spk_model, ref_matrix)
+            process(req, model, ref_matrix)
         else:
             send({"cmd": cmd, "id": req.get("id", ""), "ok": False,
                   "error": f"unknown cmd {cmd}"})

@@ -90,9 +90,8 @@ def predict_video(blob_path, h, w, on_progress=None):
     data = data[:n * frame_bytes].reshape(n, h, w, 3)
 
     preds = []
-    buf = torch.empty((BATCH_SIZE, h, w, 3), dtype=torch.uint8)
-    if _device.type == "cuda":
-        buf = buf.pin_memory()
+    # Allocate a fresh CPU staging buffer each call.
+    buf = torch.empty((BATCH_SIZE, h, w, 3), dtype=torch.uint8, pin_memory=_device.type == "cuda")
     total = max(n, 1)
     for i in range(0, n, BATCH_SIZE):
         batch = data[i: i + BATCH_SIZE]

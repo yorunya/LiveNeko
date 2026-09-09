@@ -128,10 +128,16 @@ pub struct Runner {
     pub visual_server: Option<ModelServer>,
     /// Visual model input size (height, width), read from the model config.
     pub visual_size: Option<(u32, u32)>,
+    /// Optional browser cookie import for downloads (yt-dlp
+    /// --cookies-from-browser equivalent): "" | "firefox" | "chrome" | "edge".
+    cookie_browser: String,
+    /// Cookies loaded once per run from the selected browser; None until the
+    /// first load (the value is Some(empty) when the browser yielded nothing).
+    browser_cookies: Arc<Mutex<Option<Arc<Vec<crate::cookies::Cookie>>>>>,
 }
 
 impl Runner {
-    pub fn new(app: AppHandle, assets: Assets, handle: PipelineHandle) -> Self {
+    pub fn new(app: AppHandle, assets: Assets, handle: PipelineHandle, cookie_browser: String) -> Self {
         Self {
             app,
             assets,
@@ -142,6 +148,8 @@ impl Runner {
             audio_server: None,
             visual_server: None,
             visual_size: None,
+            cookie_browser,
+            browser_cookies: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -456,8 +464,40 @@ impl Runner {
         );
     }
 
+    /// Load the configured browser's cookies once per run (cached). Enabled by
+    /// the "cookies from browser" setting; errors hard like yt-dlp's
+    /// CookieLoadError when the selected browser cannot be read.
+    fn load_cookies_once(&self) -> Result<Option<Arc<Vec<crate::cookies::Cookie>>>, String> {
+        if self.cookie_browser.is_empty() {
+            return Ok(None);
+        }
+        let mut guard = self.browser_cookies.lock().unwrap();
+        if let Some(cached) = guard.as_ref() {
+            return Ok(Some(cached.clone()));
+        }
+        let log_ref = &self;
+        let cookies = crate::cookies::load_browser_cookies(&self.cookie_browser, &|msg| {
+            log_ref.emit_log("downloader", format!("[cookies] {msg}"));
+        })?;
+        self.emit_log(
+            "downloader",
+            format!(
+                "[cookies] using cookies from {} ({} cookie(s))",
+                self.cookie_browser,
+                cookies.len()
+            ),
+        );
+        let arc = Arc::new(cookies);
+        *guard = Some(arc.clone());
+        Ok(Some(arc))
+    }
+
     /// Build a downloader for this item, wiring progress and logs to the UI.
-    fn make_downloader(&self, item_id: &str) -> crate::downloader::Downloader {
+    fn make_downloader(
+        &self,
+        item_id: &str,
+        cookies: Option<Arc<Vec<crate::cookies::Cookie>>>,
+    ) -> crate::downloader::Downloader {
         let cancel = self.handle.cancel.clone();
         let stage = self.current_stage;
         let app = self.app.clone();
@@ -480,7 +520,7 @@ impl Runner {
         let on_log = Arc::new(Mutex::new(Box::new(move |line: String| {
             log_line(&app2, &log_file2, &item_id2, &line);
         }) as Box<dyn FnMut(String) + Send>));
-        crate::downloader::Downloader::new(cancel, on_progress, on_log)
+        crate::downloader::Downloader::new(cancel, on_progress, on_log, cookies)
     }
 
     fn run_ytdlp(
@@ -491,7 +531,8 @@ impl Runner {
         quality: u32,
     ) -> Result<bool, String> {
         self.emit_log(item_id, format!("[downloader] downloading {url}"));
-        let dl = self.make_downloader(item_id);
+        let cookies = self.load_cookies_once()?;
+        let dl = self.make_downloader(item_id, cookies);
         let files = dl.download(url, out_dir, quality)?;
         self.emit_log(
             item_id,
@@ -503,7 +544,8 @@ impl Runner {
     /// List the video titles a URL yields, one per line (used to detect multi-video / multi-part pages).
     fn ytdlp_list_titles(&self, item_id: &str, url: &str) -> Result<Vec<String>, String> {
         self.emit_log(item_id, format!("[downloader] listing titles: {url}"));
-        let dl = self.make_downloader(item_id);
+        let cookies = self.load_cookies_once()?;
+        let dl = self.make_downloader(item_id, cookies);
         let titles = dl.probe_titles(url)?;
         Ok(titles
             .into_iter()
@@ -524,7 +566,8 @@ impl Runner {
             item_id,
             format!("[downloader] downloading all videos: {url}"),
         );
-        let dl = self.make_downloader(item_id);
+        let cookies = self.load_cookies_once()?;
+        let dl = self.make_downloader(item_id, cookies);
         let files = dl.download(url, out_dir, quality)?;
         self.emit_log(
             item_id,
@@ -926,14 +969,27 @@ pub fn simplify_title_str(raw: &str) -> String {
 
 /// Probe the video title(s) a URL yields. Used to show the real title in the queue immediately when a URL is added.
 /// `yt_dlp_exe` is kept for API compatibility but is no longer used; titles are
-/// fetched in-process via `crate::downloader`.
-pub fn probe_ytdlp_titles(_yt_dlp_exe: &Path, url: &str) -> Result<Vec<String>, String> {
+/// fetched in-process via `crate::downloader`. `cookie_browser` optionally
+/// enables reading that browser's cookies for the probe.
+pub fn probe_ytdlp_titles(
+    _yt_dlp_exe: &Path,
+    url: &str,
+    cookie_browser: &str,
+) -> Result<Vec<String>, String> {
     let cancel = Arc::new(AtomicBool::new(false));
     let on_progress = Arc::new(Mutex::new(Box::new(|_: u8| {}) as Box<dyn FnMut(u8) + Send>));
     let on_log = Arc::new(Mutex::new(
         Box::new(|_: String| {}) as Box<dyn FnMut(String) + Send>
     ));
-    let dl = crate::downloader::Downloader::new(cancel, on_progress, on_log);
+    let cookies = if cookie_browser.trim().is_empty() {
+        None
+    } else {
+        Some(Arc::new(crate::cookies::load_browser_cookies(
+            cookie_browser,
+            &|_: &str| {},
+        )?))
+    };
+    let dl = crate::downloader::Downloader::new(cancel, on_progress, on_log, cookies);
     let titles = dl.probe_titles(url)?;
     Ok(titles
         .into_iter()

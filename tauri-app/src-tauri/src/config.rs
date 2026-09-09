@@ -14,6 +14,9 @@ pub struct AppConfig {
     pub custom_prompt: String,
     /// Download quality for yt-dlp: 360 | 480 | 720 | 1080 (default 720).
     pub download_quality: u32,
+    /// Optional browser cookie import for downloads (yt-dlp
+    /// --cookies-from-browser equivalent): "" | "firefox" | "chrome" | "edge".
+    pub cookie_browser: String,
     /// Whether the environment check has already been run (persisted across launches).
     pub env_checked: bool,
     /// Speaker display name used in transcripts (e.g. "taffy"). Empty = no speaker identification.
@@ -51,6 +54,7 @@ impl AppConfig {
             engine: "api".to_string(),
             custom_prompt: String::new(),
             download_quality: 720,
+            cookie_browser: String::new(),
             env_checked: false,
             speaker_name: String::new(),
             speaker_ref: String::new(),
@@ -101,6 +105,9 @@ impl AppConfig {
         }
         if !matches!(self.download_quality, 360 | 480 | 720 | 1080) {
             self.download_quality = 720;
+        }
+        if !matches!(self.cookie_browser.as_str(), "" | "firefox" | "chrome" | "edge") {
+            self.cookie_browser.clear();
         }
         if self.ollama_base_url.is_empty() {
             self.ollama_base_url = "http://localhost:11434/v1".to_string();

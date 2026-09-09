@@ -136,6 +136,10 @@ const I18N = {
     "settings.speakerWavRequired": "Choose a reference WAV file for this speaker.",
     "settings.qualityTitle": "Video download quality",
     "settings.qualityHint": "Resolution used when downloading a video from a Bilibili URL (360P / 480P / 720P / 1080P). Lower is faster and smaller; default is 720P.",
+    "settings.cookiesTitle": "Browser cookies",
+    "settings.cookiesHint": "Optionally reuse the login cookies of a local browser for video downloads (same source as yt-dlp --cookies-from-browser). Useful for logged-in / higher-quality downloads. Downloads also work without it. Close the selected browser while downloading so its cookie database can be read.",
+    "settings.cookiesBrowser": "Read cookies from",
+    "settings.cookiesOff": "Disabled",
     "settings.engineTitle": "Summarization Engine",
     "settings.engineHint": "Choose where the summary LLM runs: a hosted OpenAI-compatible API, a local Ollama server, or a llama.cpp server.",
     "settings.engineApi": "OpenAI-compatible API",
@@ -279,6 +283,10 @@ const I18N = {
     "settings.speakerWavRequired": "请为该说话人选择参考 WAV 文件。",
     "settings.qualityTitle": "视频下载清晰度",
     "settings.qualityHint": "从链接下载视频时使用的分辨率（360P / 480P / 720P / 1080P）",
+    "settings.cookiesTitle": "浏览器 Cookie",
+    "settings.cookiesHint": "可选择在下载视频时复用本地浏览器的登录 Cookie（数据来源与 yt-dlp --cookies-from-browser 相同）。适合需要登录或更高清晰度的下载；不开启也能正常下载。下载时请先关闭所选浏览器，否则无法读取其 Cookie 数据库。",
+    "settings.cookiesBrowser": "读取 Cookie 的浏览器",
+    "settings.cookiesOff": "不启用",
     "settings.engineTitle": "LLM引擎",
     "settings.engineHint": "选择总结摘要的LLM：OpenAI 兼容 API或自定义本地 服务",
     "settings.engineApi": "OpenAI 兼容 API",
@@ -578,6 +586,9 @@ async function loadSettings() {
   setLanguage(state.config.language || "");
   setEngine(state.config.engine || "api");
   setQuality(state.config.downloadQuality || 720);
+  $("#cfg-cookie-browser").value = ["", "firefox", "chrome", "edge"].includes(state.config.cookieBrowser)
+    ? state.config.cookieBrowser
+    : "";
   try {
     $("#cfg-prompt").value = await invoke("get_prompt");
   } catch {
@@ -639,6 +650,7 @@ async function saveSettings() {
     videonekoModelDir: $("#cfg-videoneko").value.trim(),
     engine,
     downloadQuality: qualityInput ? parseInt(qualityInput.value) || 720 : 720,
+    cookieBrowser: $("#cfg-cookie-browser").value,
     language: $("#cfg-language").value,
     customPrompt: $("#cfg-prompt").value,
     speakerName: spkName,

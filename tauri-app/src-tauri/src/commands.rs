@@ -407,7 +407,8 @@ pub async fn add_url(
         Some(t) if !t.trim().is_empty() => t,
         _ => {
             let assets = crate::assets::Assets::resolve(&app);
-            match crate::pipeline::probe_ytdlp_titles(&assets.yt_dlp_exe, &url) {
+            let cookie_browser = state.config.lock().unwrap().cookie_browser.clone();
+            match crate::pipeline::probe_ytdlp_titles(&assets.yt_dlp_exe, &url, &cookie_browser) {
                 Ok(titles) => titles
                     .first()
                     .map(|t| crate::pipeline::simplify_title_str(t))
@@ -490,7 +491,8 @@ pub fn start_pipeline(app: AppHandle, state: State<'_, AppState>) -> Result<(), 
     let work_root = work_root;
 
     std::thread::spawn(move || {
-        let mut runner = Runner::new(app2.clone(), assets.clone(), handle.clone());
+        let mut runner =
+            Runner::new(app2.clone(), assets.clone(), handle.clone(), cfg.cookie_browser.clone());
         // launch resident model servers ONCE (models load here, reused for all queued videos); they stay alive until the queue is done.
         if let Err(e) = runner.start_model_servers(&cfg) {
             log_line(
@@ -853,7 +855,12 @@ pub fn re_summarize(
         return Err(format!("stored visual.txt not found for '{stem}'"));
     }
     let config = state.config.lock().unwrap().clone();
-    let runner = Runner::new(app.clone(), assets, state.pipeline.clone());
+    let runner = Runner::new(
+        app.clone(),
+        assets,
+        state.pipeline.clone(),
+        config.cookie_browser.clone(),
+    );
     // mark as running so the UI hides the Start button / shows state
     state.pipeline.cancel.store(false, Ordering::SeqCst);
     let app2 = app.clone();

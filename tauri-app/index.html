@@ -132,6 +132,21 @@
           </div>
 
           <div class="card">
+            <h2 data-i18n="settings.cookiesTitle">Browser cookies</h2>
+            <p class="hint" data-i18n="settings.cookiesHint">Optionally reuse the login cookies of a local browser for video downloads (same source as yt-dlp --cookies-from-browser). Useful for logged-in / higher-quality downloads. Downloads also work without it. Close the selected browser while downloading so its cookie database can be read.</p>
+            <div class="row">
+              <label class="wide"><span data-i18n="settings.cookiesBrowser">Read cookies from</span>
+                <select id="cfg-cookie-browser">
+                  <option value="" data-i18n="settings.cookiesOff">Disabled</option>
+                  <option value="firefox">Firefox</option>
+                  <option value="chrome">Chrome</option>
+                  <option value="edge">Edge</option>
+                </select>
+              </label>
+            </div>
+          </div>
+
+          <div class="card">
             <h2 data-i18n="settings.engineTitle">Summarization Engine</h2>
             <p class="hint" data-i18n="settings.engineHint">Choose where the summary LLM runs: a hosted OpenAI-compatible API, a local Ollama server, or a llama.cpp server.</p>
             <div class="row">

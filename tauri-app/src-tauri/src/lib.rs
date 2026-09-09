@@ -1,6 +1,7 @@
 mod assets;
 mod commands;
 mod config;
+mod cookies;
 mod df_denoise;
 mod downloader;
 mod model_ipc;

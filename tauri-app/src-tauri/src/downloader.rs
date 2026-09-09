@@ -1,5 +1,24 @@
 //! In-process, unauthenticated video downloader for Bilibili and YouTube.
+//!
+//! Mirrors the relevant parts of the yt-dlp reference implementation:
+//! - Bilibili: `x/player/wbi/playurl` with WBI signing + danmaku fingerprint
+//!   params (`BilibiliBaseIE._download_playinfo`), DASH best-video+best-audio
+//!   pick (including dolby/FLAC audio tracks), and legacy single-segment
+//!   `durl` fallback.
+//! - YouTube: Innertube `youtubei/v1/player` with the default client list
+//!   `('visionos', 'web')` (`YoutubeIE._DEFAULT_CLIENTS`), client headers +
+//!   visitor data, `bv*+ba/b` format-selection order (adaptive merge first,
+//!   progressive only as a fallback), DRM/OTF formats skipped. Like yt-dlp,
+//!   signatureCipher solving and PO-token minting are NOT implemented.
+//! - Transport: ranged, resumable, retried chunked downloads (yt-dlp's
+//!   http downloader behavior) with ffmpeg `-c copy -movflags +faststart`
+//!   merging (same flags as yt-dlp's FFmpegMergerPP).
+//! - Optional browser cookies (yt-dlp `--cookies-from-browser` equivalent,
+//!   see `cookies.rs`): sent on all requests; a SESSDATA cookie marks the
+//!   Bilibili session as logged in (drops `try_look`), YouTube "web" client
+//!   calls carry cookies + SAPISIDHASH authorization.
 
+use crate::cookies::{self, Cookie};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -93,7 +112,12 @@ impl HttpClient {
         serde_json::from_slice(&out.stdout).map_err(|e| format!("invalid json: {e}"))
     }
 
-    /// Download a URL to a local file, reporting progress (0..100) via `on_progress`.
+    /// Download a URL to a local file with ranged, resumable, retried chunks,
+    /// reporting progress (0..100) via `on_progress`. Mirrors yt-dlp's http
+    /// downloader: 10 MB range chunks, resume from a `.part` file, per-chunk
+    /// retries, stall detection. The `.part` file is keyed by the URL (so a
+    /// re-signed URL for a different quality starts fresh) and kept on
+    /// failure/cancel for a later resume.
     fn download_file(
         &self,
         url: &str,
@@ -102,15 +126,222 @@ impl HttpClient {
         cancel: &Arc<AtomicBool>,
         on_progress: Arc<Mutex<Box<dyn FnMut(u8) + Send>>>,
     ) -> Result<(), String> {
+        let part = part_path(url);
+        let mut start = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+        let report = |on_progress: &Arc<Mutex<Box<dyn FnMut(u8) + Send>>>, p: u8| {
+            let mut cb = on_progress.lock().unwrap();
+            (cb)(p);
+        };
+
+        // Probe the total size with a 1-byte ranged request so we can chunk
+        // the transfer and report exact progress.
+        let total = match self.probe_total(url, start, extra_headers) {
+            Ok(Some(t)) => t,
+            Ok(None) => {
+                // Server gave no usable length: fall back to one plain
+                // streaming GET continued onto the part file.
+                return self.stream_plain(url, &part, dest, extra_headers, cancel, &report, &on_progress);
+            }
+            Err(e) => return Err(e),
+        };
+        if start > total {
+            // Part is longer than the remote file (content changed): restart.
+            let _ = std::fs::remove_file(&part);
+            start = 0;
+        }
+        if start >= total {
+            // Part already complete from a previous run.
+            let _ = std::fs::remove_file(dest);
+            std::fs::rename(&part, dest)
+                .map_err(|e| format!("move part -> dest: {e}"))?;
+            report(&on_progress, 100);
+            return Ok(());
+        }
+
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&part)
+            .map_err(|e| format!("open part file: {e}"))?;
+        use std::io::Write;
+        while start < total {
+            if cancel.load(Ordering::SeqCst) {
+                return Err("cancelled".into());
+            }
+            let end = (start + DL_CHUNK_SIZE).min(total) - 1;
+            let expected = (end - start + 1) as usize;
+            let mut chunk_done = false;
+            for attempt in 0..DL_MAX_ATTEMPTS {
+                if cancel.load(Ordering::SeqCst) {
+                    return Err("cancelled".into());
+                }
+                match self.fetch_range(url, start, end, extra_headers) {
+                    Ok(bytes) if bytes.len() == expected => {
+                        file.write_all(&bytes)
+                            .map_err(|e| format!("write part: {e}"))?;
+                        start += expected as u64;
+                        chunk_done = true;
+                        break;
+                    }
+                    Ok(_) | Err(_) => {
+                        // Retry with a small backoff, like yt-dlp's RetryManager.
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            500 * (attempt as u64 + 1),
+                        ));
+                    }
+                }
+            }
+            if !chunk_done {
+                return Err(format!(
+                    "download failed after {DL_MAX_ATTEMPTS} retries at byte {start}/{total} (partial data kept for resume)"
+                ));
+            }
+            let p = ((start as f64 / total as f64) * 100.0).min(100.0) as u8;
+            report(&on_progress, p);
+        }
+        drop(file);
+        let _ = std::fs::remove_file(dest);
+        std::fs::rename(&part, dest)
+            .map_err(|e| format!("move part -> dest: {e}"))?;
+        report(&on_progress, 100);
+        Ok(())
+    }
+
+    /// One ranged GET; returns the body bytes. Aborts when the transfer
+    /// stalls (<1 KiB/s for 60 s) instead of a fixed total timeout.
+    fn fetch_range(
+        &self,
+        url: &str,
+        start: u64,
+        end: u64,
+        extra_headers: &[(&str, &str)],
+    ) -> Result<Vec<u8>, String> {
         let mut cmd = std::process::Command::new("curl");
-        cmd.arg("-sSL")
-            .arg("--compressed")
+        cmd.arg("-sS")
+            .arg("-L")
+            .arg("--connect-timeout")
+            .arg("15")
+            .arg("--speed-time")
+            .arg("60")
+            .arg("--speed-limit")
+            .arg("1024")
+            .arg("--range")
+            .arg(format!("{start}-{end}"));
+        for (k, v) in &self.default_headers {
+            cmd.arg("-H").arg(format!("{k}: {v}"));
+        }
+        for (k, v) in extra_headers {
+            cmd.arg("-H").arg(format!("{k}: {v}"));
+        }
+        cmd.arg(url);
+        crate::pipeline::hide_console(&mut cmd);
+        let out = cmd
+            .output()
+            .map_err(|e| format!("curl: {e}"))?;
+        if !out.status.success() {
+            return Err(format!("curl range fetch failed: {}", out.status));
+        }
+        Ok(out.stdout)
+    }
+
+    /// Probe the file's total size via a 1-byte ranged GET.
+    /// `Ok(Some(total))` when known, `Ok(None)` when the server does not
+    /// support ranges or report a length.
+    fn probe_total(
+        &self,
+        url: &str,
+        start: u64,
+        extra_headers: &[(&str, &str)],
+    ) -> Result<Option<u64>, String> {
+        let body_tmp = std::env::temp_dir().join(format!(
+            "liveneko_probe_{}",
+            std::process::id()
+        ));
+        let mut cmd = std::process::Command::new("curl");
+        cmd.arg("-sS")
+            .arg("-L")
             .arg("--connect-timeout")
             .arg("15")
             .arg("--max-time")
-            .arg("600")
+            .arg("60")
+            .arg("-D")
+            .arg("-")
             .arg("-o")
-            .arg(dest);
+            .arg(&body_tmp)
+            .arg("--range")
+            .arg(format!("{start}-{}", start + 1023));
+        for (k, v) in &self.default_headers {
+            cmd.arg("-H").arg(format!("{k}: {v}"));
+        }
+        for (k, v) in extra_headers {
+            cmd.arg("-H").arg(format!("{k}: {v}"));
+        }
+        cmd.arg(url);
+        crate::pipeline::hide_console(&mut cmd);
+        let out = cmd.output().map_err(|e| format!("curl: {e}"));
+        let _ = std::fs::remove_file(&body_tmp);
+        let out = out?;
+        if !out.status.success() {
+            return Err(format!("curl probe failed: {}", out.status));
+        }
+        let headers = String::from_utf8_lossy(&out.stdout);
+        let mut status = 0u16;
+        let mut content_length = 0u64;
+        let mut total_from_range: Option<u64> = None;
+        for line in headers.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("HTTP/") {
+                if let Some(code_str) = rest.split_whitespace().nth(1) {
+                    status = code_str.parse().unwrap_or(0);
+                }
+            } else if let Some(v) = strip_header(line, "content-length") {
+                content_length = v.trim().parse().unwrap_or(0);
+            } else if let Some(v) = strip_header(line, "content-range") {
+                // "bytes start-end/total" (total may be "*")
+                if let Some(total) = v.rsplit('/').next() {
+                    total_from_range = total.trim().parse().ok();
+                }
+            }
+        }
+        match status {
+            206 => Ok(total_from_range),
+            // 200 = server ignored the Range header: restart from scratch
+            200 => Ok(if content_length > 0 {
+                Some(content_length)
+            } else {
+                None
+            }),
+            // 416 = start beyond EOF; recover the size from "bytes */N"
+            416 => Ok(total_from_range),
+            _ => Ok(None),
+        }
+    }
+
+    /// Plain streaming download for servers without range/length support.
+    #[allow(clippy::too_many_arguments)]
+    fn stream_plain(
+        &self,
+        url: &str,
+        part: &Path,
+        dest: &Path,
+        extra_headers: &[(&str, &str)],
+        cancel: &Arc<AtomicBool>,
+        report: &dyn Fn(&Arc<Mutex<Box<dyn FnMut(u8) + Send>>>, u8),
+        on_progress: &Arc<Mutex<Box<dyn FnMut(u8) + Send>>>,
+    ) -> Result<(), String> {
+        let mut cmd = std::process::Command::new("curl");
+        cmd.arg("-sS")
+            .arg("-L")
+            .arg("--connect-timeout")
+            .arg("15")
+            .arg("--speed-time")
+            .arg("60")
+            .arg("--speed-limit")
+            .arg("1024")
+            .arg("-C")
+            .arg("-")
+            .arg("-o")
+            .arg(part);
         for (k, v) in &self.default_headers {
             cmd.arg("-H").arg(format!("{k}: {v}"));
         }
@@ -120,50 +351,30 @@ impl HttpClient {
         cmd.arg(url);
         crate::pipeline::hide_console(&mut cmd);
         let mut child = cmd
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn()
             .map_err(|e| format!("curl: {e}"))?;
-        let stderr = child.stderr.take().expect("stderr piped");
-        // curl writes a simple progress meter to stderr when not silent; we
-        // read it in a thread so we can parse the percentage.
-        let cancel2 = cancel.clone();
-        let on_progress2 = on_progress.clone();
-        let stderr_handle = std::thread::spawn(move || {
-            use std::io::{BufRead, BufReader};
-            let reader = BufReader::new(stderr);
-            let mut last = 0u8;
-            for line in reader.lines() {
-                if cancel2.load(Ordering::SeqCst) {
-                    break;
-                }
-                if let Ok(l) = line {
-                    // curl progress: "  % Total    % Received ..." or "  3.5%"
-                    for token in l.split_whitespace() {
-                        if let Some(pct) = token.strip_suffix('%') {
-                            if let Ok(f) = pct.parse::<f32>() {
-                                let p = f as u8;
-                                if p > last {
-                                    last = p;
-                                    let mut cb = on_progress2.lock().unwrap();
-                                    (cb)(p);
-                                }
-                            }
-                        }
+        loop {
+            if cancel.load(Ordering::SeqCst) {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err("cancelled".into());
+            }
+            match child.try_wait().map_err(|e| format!("curl wait: {e}"))? {
+                Some(status) => {
+                    if status.success() {
+                        break Ok(());
+                    } else {
+                        break Err(format!("curl download failed: {status}"));
                     }
                 }
+                None => std::thread::sleep(std::time::Duration::from_millis(200)),
             }
-        });
-        let status = child.wait().map_err(|e| format!("curl wait: {e}"))?;
-        let _ = stderr_handle.join();
-        if cancel.load(Ordering::SeqCst) {
-            let _ = std::fs::remove_file(dest);
-            return Err("cancelled".into());
-        }
-        if !status.success() {
-            let _ = std::fs::remove_file(dest);
-            return Err(format!("curl download failed: {status}"));
-        }
+        }?;
+        let _ = std::fs::remove_file(dest);
+        std::fs::rename(part, dest).map_err(|e| format!("move part -> dest: {e}"))?;
+        report(on_progress, 100);
         Ok(())
     }
 }
@@ -294,6 +505,8 @@ pub struct Downloader {
     on_progress: Arc<Mutex<Box<dyn FnMut(u8) + Send>>>,
     /// Log callback.
     on_log: Arc<Mutex<Box<dyn FnMut(String) + Send>>>,
+    /// Optional browser cookies (yt-dlp --cookies-from-browser equivalent).
+    cookies: Option<Arc<Vec<Cookie>>>,
 }
 
 impl Downloader {
@@ -301,6 +514,7 @@ impl Downloader {
         cancel: Arc<AtomicBool>,
         on_progress: Arc<Mutex<Box<dyn FnMut(u8) + Send>>>,
         on_log: Arc<Mutex<Box<dyn FnMut(String) + Send>>>,
+        cookies: Option<Arc<Vec<Cookie>>>,
     ) -> Self {
         Self {
             http: HttpClient::new(),
@@ -308,6 +522,7 @@ impl Downloader {
             cancel,
             on_progress,
             on_log,
+            cookies,
         }
     }
 
@@ -319,6 +534,53 @@ impl Downloader {
     fn progress(&self, p: u8) {
         let mut f = self.on_progress.lock().unwrap();
         (f)(p);
+    }
+
+    /// `("Cookie", "name=value; ...")` for the request host, when any browser
+    /// cookie matches (yt-dlp sends cookies by the same domain matching).
+    fn cookie_pair(&self, url: &str) -> Option<(&'static str, String)> {
+        let cs = self.cookies.as_ref()?;
+        cookies::cookie_header(cs, host_of(url)).map(|v| ("Cookie", v))
+    }
+
+    /// Whether a logged-in Bilibili session was imported (SESSDATA cookie),
+    /// the same check as `BilibiliBaseIE.is_logged_in`.
+    fn bilibili_logged_in(&self) -> bool {
+        self.cookies
+            .as_ref()
+            .map(|cs| cookies::find_cookie(cs, "www.bilibili.com", "SESSDATA").is_some())
+            .unwrap_or(false)
+    }
+
+    /// yt-dlp `_get_sid_authorization_header`: SAPISIDHASH / SAPISID1PHASH /
+    /// SAPISID3PHASH tokens over the imported YouTube cookies.
+    fn sid_authorization(&self) -> Option<String> {
+        let cs = self.cookies.as_ref()?;
+        let get = |name: &str| cookies::find_cookie(cs, "www.youtube.com", name).map(str::to_string);
+        let origin = "https://www.youtube.com";
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+            .to_string();
+        let make = |scheme: &str, sid: String| {
+            format!("{scheme} {ts}_{}", sha1_hex(&format!("{ts} {sid} {origin}")))
+        };
+        let mut out: Vec<String> = Vec::new();
+        if let Some(sid) = get("SAPISID").or_else(|| get("__Secure-3PAPISID")) {
+            out.push(make("SAPISIDHASH", sid));
+        }
+        if let Some(sid) = get("__Secure-1PAPISID") {
+            out.push(make("SAPISID1PHASH", sid));
+        }
+        if let Some(sid) = get("__Secure-3PAPISID") {
+            out.push(make("SAPISID3PHASH", sid));
+        }
+        if out.is_empty() {
+            None
+        } else {
+            Some(out.join(" "))
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -429,16 +691,24 @@ impl Downloader {
     /// risk-blocked (HTTP 412 / code -352); falls back to scraping
     /// `__INITIAL_STATE__` from the page (also covers festival pages).
     fn bilibili_meta(&self, url: &str) -> Result<BiliMeta, String> {
+        let mut api_headers: Vec<(&str, String)> =
+            vec![("Referer", "https://www.bilibili.com/".into())];
+        if let Some(pair) = self.cookie_pair("https://api.bilibili.com/") {
+            api_headers.push(pair);
+        }
+        let api_headers_ref: Vec<(&str, &str)> =
+            api_headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+
         if let Some((id, is_bvid)) = bilibili_id_from_url(url) {
             let q = if is_bvid {
                 format!("bvid={}", urlencode(&id))
             } else {
                 format!("aid={}", urlencode(id.trim_start_matches("av")))
             };
-            if let Ok(v) = self.http.get_json(
-                &format!("https://api.bilibili.com/x/web-interface/view?{q}"),
-                &[("Referer", "https://www.bilibili.com/")],
-            ) {
+            if let Ok(v) = self
+                .http
+                .get_json(&format!("https://api.bilibili.com/x/web-interface/view?{q}"), &api_headers_ref)
+            {
                 let code = v.get("code").and_then(Value::as_i64).unwrap_or(-1);
                 if code == 0 {
                     if let Some(d) = v.get("data") {
@@ -483,9 +753,13 @@ impl Downloader {
         }
 
         // Fallback: scrape the HTML page (festival pages etc.).
-        let html = self
-            .http
-            .get_text(url, &[("Referer", "https://www.bilibili.com/")])?;
+        let mut page_headers: Vec<(&str, String)> = vec![("Referer", "https://www.bilibili.com/".into())];
+        if let Some(pair) = self.cookie_pair(url) {
+            page_headers.push(pair);
+        }
+        let page_headers_ref: Vec<(&str, &str)> =
+            page_headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let html = self.http.get_text(url, &page_headers_ref)?;
         let initial = extract_json_object(&html, "window.__INITIAL_STATE__").ok_or_else(|| {
             if html.contains("v_voucher") || html.contains("err-code\">412") {
                 "bilibili risk control rejected the request (rate limited); try again later"
@@ -557,10 +831,18 @@ impl Downloader {
                 }
             }
         }
-        let nav = self.http.get_json(
-            "https://api.bilibili.com/x/web-interface/nav",
-            &[("Referer", "https://www.bilibili.com/")],
-        )?;
+        let nav_headers: Vec<(&str, String)> = {
+            let mut h = vec![("Referer", "https://www.bilibili.com/".to_string())];
+            if let Some(pair) = self.cookie_pair("https://api.bilibili.com/") {
+                h.push(pair);
+            }
+            h
+        };
+        let nav_headers_ref: Vec<(&str, &str)> =
+            nav_headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let nav = self
+            .http
+            .get_json("https://api.bilibili.com/x/web-interface/nav", &nav_headers_ref)?;
         let img = nav
             .pointer("/data/wbi_img/img_url")
             .and_then(Value::as_str)
@@ -669,7 +951,7 @@ impl Downloader {
         ]
     }
 
-    /// Fetch the playurl (DASH formats) for one cid, WBI-signed and carrying the danmaku fingerprint params, exactly as yt-dlp's `_download_playinfo` does for an unauthenticated session (`try_look=1`, `fnval=4048`).
+    /// Fetch the playurl (DASH formats) for one cid, WBI-signed and carrying the danmaku fingerprint params, exactly as yt-dlp's `_download_playinfo` does. `try_look` is only sent for anonymous sessions (yt-dlp drops it when logged in); browser cookies are forwarded so logged-in qualities are returned.
     fn bilibili_playurl(&self, bvid: &str, cid: u64) -> Result<Value, String> {
         let wbi_key = self.bilibili_wbi_key()?;
         let wts = SystemTime::now()
@@ -680,12 +962,14 @@ impl Downloader {
             ("bvid".to_string(), bvid.to_string()),
             ("cid".to_string(), cid.to_string()),
             ("fnval".to_string(), "4048".to_string()),
-            ("try_look".to_string(), "1".to_string()),
             ("wts".to_string(), wts.to_string()),
         ]
         .into_iter()
         .collect();
-        // yt-dlp only drops `try_look` when logged in; unauthenticated keeps it.
+        // yt-dlp only sends try_look when NOT logged in (`is_logged_in` = SESSDATA).
+        if !self.bilibili_logged_in() {
+            params.insert("try_look".to_string(), "1".to_string());
+        }
         for (k, v) in self.bilibili_dm_params() {
             params.insert(k, v);
         }
@@ -713,9 +997,16 @@ impl Downloader {
         qs.push_str(&format!("&w_rid={}", urlencode(&params["w_rid"])));
 
         let url = format!("https://api.bilibili.com/x/player/wbi/playurl?{qs}");
-        let raw = self
-            .http
-            .get_json(&url, &[("Referer", "https://www.bilibili.com/")])?;
+        let mut req_headers: Vec<(&str, String)> = vec![
+            ("Referer", "https://www.bilibili.com/".into()),
+            ("Origin", "https://www.bilibili.com".into()),
+        ];
+        if let Some(pair) = self.cookie_pair("https://api.bilibili.com/") {
+            req_headers.push(pair);
+        }
+        let req_headers_ref: Vec<(&str, &str)> =
+            req_headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let raw = self.http.get_json(&url, &req_headers_ref)?;
         let code = raw.get("code").and_then(Value::as_i64).unwrap_or(-1);
         if code != 0 {
             let msg = raw
@@ -736,93 +1027,166 @@ impl Downloader {
         referer: &str,
         quality: u32,
     ) -> Result<(), String> {
-        let dash = play_info
-            .get("dash")
-            .ok_or("bilibili: no dash formats in playurl")?;
-        let videos = dash
-            .get("video")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let audios = dash
-            .get("audio")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-
-        let best_video = videos
-            .iter()
-            .filter(|v| {
-                v.get("height")
-                    .and_then(Value::as_u64)
-                    .map(|h| h <= quality as u64)
-                    .unwrap_or(false)
-            })
-            .max_by_key(|v| v.get("height").and_then(Value::as_u64).unwrap_or(0))
-            .or_else(|| {
-                videos
-                    .iter()
-                    .max_by_key(|v| v.get("height").and_then(Value::as_u64).unwrap_or(0))
-            })
-            .cloned()
-            .ok_or("bilibili: no suitable video format")?;
-        let best_audio = audios
-            .iter()
-            .max_by_key(|a| a.get("bandwidth").and_then(Value::as_u64).unwrap_or(0))
-            .cloned();
-
-        let video_url = best_video
-            .get("baseUrl")
-            .and_then(Value::as_str)
-            .or_else(|| best_video.get("base_url").and_then(Value::as_str))
-            .ok_or("bilibili: video url missing")?;
-        let audio_url = best_audio
-            .as_ref()
-            .and_then(|a| {
-                a.get("baseUrl")
-                    .and_then(Value::as_str)
-                    .or_else(|| a.get("base_url").and_then(Value::as_str))
-            })
-            .map(|s| s.to_string());
-
-        let tmp_video = dest.with_extension("video.m4s");
-        let tmp_audio = dest.with_extension("audio.m4s");
-        let headers = [("Referer", referer)];
-
-        // Video (50% of progress), audio (next 30%), merge (last 20%).
-        let video_progress = Arc::new(Mutex::new(Box::new({
-            let on_progress = self.on_progress.clone();
-            move |p: u8| {
-                let mut f = on_progress.lock().unwrap();
-                (f)(p / 2);
+        // CDN request headers: yt-dlp downloads DASH media with
+        // `http_headers: {'Referer': url}` (+ cookies for matching domains).
+        let cdn_headers = |media_url: &str| -> Vec<(&'static str, String)> {
+            let mut h: Vec<(&'static str, String)> = vec![("Referer", referer.to_string())];
+            if let Some(pair) = self.cookie_pair(media_url) {
+                h.push(pair);
             }
-        }) as Box<dyn FnMut(u8) + Send>));
-        self.http.download_file(
-            video_url,
-            &tmp_video,
-            &headers,
-            &self.cancel,
-            video_progress,
-        )?;
+            h
+        };
 
-        if let Some(aurl) = audio_url {
-            let audio_progress = Arc::new(Mutex::new(Box::new({
+        if let Some(dash) = play_info.get("dash") {
+            let videos = dash
+                .get("video")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            // yt-dlp includes `dash.audio`, `dash.dolby.audio` and `dash.flac.audio`
+            // in the format list; the best one is picked by bandwidth.
+            let mut audios = dash
+                .get("audio")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            for extra in ["dolby", "flac"] {
+                if let Some(list) = dash
+                    .get(extra)
+                    .and_then(|d| d.get("audio"))
+                    .and_then(Value::as_array)
+                {
+                    audios.extend(list.iter().cloned());
+                }
+            }
+
+            let best_video = videos
+                .iter()
+                .filter(|v| {
+                    v.get("height")
+                        .and_then(Value::as_u64)
+                        .map(|h| h <= quality as u64)
+                        .unwrap_or(false)
+                })
+                .max_by_key(|v| v.get("height").and_then(Value::as_u64).unwrap_or(0))
+                .or_else(|| {
+                    videos
+                        .iter()
+                        .max_by_key(|v| v.get("height").and_then(Value::as_u64).unwrap_or(0))
+                })
+                .cloned()
+                .ok_or("bilibili: no suitable video format")?;
+            let best_audio = audios
+                .iter()
+                .max_by_key(|a| a.get("bandwidth").and_then(Value::as_u64).unwrap_or(0))
+                .cloned();
+
+            let video_url = best_video
+                .get("baseUrl")
+                .and_then(Value::as_str)
+                .or_else(|| best_video.get("base_url").and_then(Value::as_str))
+                .ok_or("bilibili: video url missing")?
+                .to_string();
+            let audio_url = best_audio
+                .as_ref()
+                .and_then(|a| {
+                    a.get("baseUrl")
+                        .and_then(Value::as_str)
+                        .or_else(|| a.get("base_url").and_then(Value::as_str))
+                })
+                .map(|s| s.to_string());
+
+            let tmp_video = dest.with_extension("video.m4s");
+            let tmp_audio = dest.with_extension("audio.m4s");
+            let v_headers = cdn_headers(&video_url);
+            let v_headers_ref: Vec<(&str, &str)> =
+                v_headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+
+            // Video (50% of progress), audio (next 30%), merge (last 20%).
+            let video_progress = Arc::new(Mutex::new(Box::new({
                 let on_progress = self.on_progress.clone();
                 move |p: u8| {
                     let mut f = on_progress.lock().unwrap();
-                    (f)(50 + p * 3 / 10);
+                    (f)(p / 2);
                 }
             }) as Box<dyn FnMut(u8) + Send>));
-            self.http
-                .download_file(&aurl, &tmp_audio, &headers, &self.cancel, audio_progress)?;
+            self.http.download_file(
+                &video_url,
+                &tmp_video,
+                &v_headers_ref,
+                &self.cancel,
+                video_progress,
+            )?;
+
+            if let Some(aurl) = audio_url {
+                let a_headers = cdn_headers(&aurl);
+                let a_headers_ref: Vec<(&str, &str)> =
+                    a_headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                let audio_progress = Arc::new(Mutex::new(Box::new({
+                    let on_progress = self.on_progress.clone();
+                    move |p: u8| {
+                        let mut f = on_progress.lock().unwrap();
+                        (f)(50 + p * 3 / 10);
+                    }
+                }) as Box<dyn FnMut(u8) + Send>));
+                self.http.download_file(
+                    &aurl,
+                    &tmp_audio,
+                    &a_headers_ref,
+                    &self.cancel,
+                    audio_progress,
+                )?;
+            }
+
+            self.progress(80);
+            self.merge_av(&tmp_video, tmp_audio.exists().then_some(tmp_audio.clone()), dest)?;
+            self.progress(100);
+            return Ok(());
         }
 
-        self.progress(80);
-        // Merge with ffmpeg
+        // Legacy non-DASH response (`durl`): yt-dlp treats a single segment as
+        // one plain http format; multi-segment FLV becomes a multi-video that
+        // does not fit this pipeline, so it is rejected with a clear message.
+        let durl = play_info
+            .get("durl")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if durl.len() > 1 {
+            return Err(format!(
+                "bilibili: legacy video is split into {} segments (old FLV format), which this app cannot download",
+                durl.len()
+            ));
+        }
+        let url = durl
+            .first()
+            .and_then(|f| {
+                f.get("url")
+                    .and_then(Value::as_str)
+                    .or_else(|| f.get("baseUrl").and_then(Value::as_str))
+            })
+            .ok_or("bilibili: no dash or durl formats in playurl")?;
+        let headers = cdn_headers(url);
+        let headers_ref: Vec<(&str, &str)> =
+            headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        self.http.download_file(
+            url,
+            dest,
+            &headers_ref,
+            &self.cancel,
+            self.on_progress.clone(),
+        )?;
+        self.progress(100);
+        Ok(())
+    }
+
+    /// ffmpeg `-c copy` merge with `+faststart`, the same flags yt-dlp's
+    /// FFmpegMergerPP uses for mp4 output. Removes the inputs afterwards.
+    fn merge_av(&self, video: &Path, audio: Option<PathBuf>, dest: &Path) -> Result<(), String> {
         let mut cmd = std::process::Command::new(&self.ffmpeg);
-        cmd.arg("-y").arg("-i").arg(&tmp_video);
-        if tmp_audio.exists() {
-            cmd.arg("-i").arg(&tmp_audio);
+        cmd.arg("-y").arg("-i").arg(video);
+        if let Some(a) = &audio {
+            cmd.arg("-i").arg(a);
         }
         cmd.arg("-c")
             .arg("copy")
@@ -831,8 +1195,10 @@ impl Downloader {
             .arg(dest);
         crate::pipeline::hide_console(&mut cmd);
         let out = cmd.output().map_err(|e| format!("ffmpeg: {e}"))?;
-        let _ = std::fs::remove_file(&tmp_video);
-        let _ = std::fs::remove_file(&tmp_audio);
+        let _ = std::fs::remove_file(video);
+        if let Some(a) = audio {
+            let _ = std::fs::remove_file(a);
+        }
         if !out.status.success() {
             let _ = std::fs::remove_file(dest);
             return Err(format!(
@@ -840,7 +1206,6 @@ impl Downloader {
                 String::from_utf8_lossy(&out.stderr).trim()
             ));
         }
-        self.progress(100);
         Ok(())
     }
 
@@ -879,188 +1244,246 @@ impl Downloader {
         let streaming = pr
             .get("streamingData")
             .ok_or("youtube: no streamingData in player response")?;
-        let mut formats = Vec::new();
-        if let Some(f) = streaming.get("formats").and_then(Value::as_array) {
-            formats.extend(f.iter().cloned());
-        }
-        if let Some(f) = streaming.get("adaptiveFormats").and_then(Value::as_array) {
-            formats.extend(f.iter().cloned());
-        }
+        let adaptive = streaming
+            .get("adaptiveFormats")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let muxed = streaming
+            .get("formats")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
 
-        // Prefer progressive (has both audio+video) at requested quality.
-        let progressive = formats
+        // Format selection follows yt-dlp's default `bv*+ba/b`: separate best
+        // video + best audio first, a progressive (muxed) format only as a
+        // last resort. DRM and OTF streams are skipped like yt-dlp does.
+        let usable = |f: &Value| -> bool {
+            let has_drm = f
+                .get("drmFamilies")
+                .and_then(Value::as_array)
+                .map(|a| !a.is_empty())
+                .unwrap_or(false);
+            !has_drm
+                && f.get("type").and_then(Value::as_str) != Some("FORMAT_STREAM_TYPE_OTF")
+        };
+        let video_key = |v: &Value| {
+            (
+                v.get("height").and_then(Value::as_u64).unwrap_or(0),
+                v.get("bandwidth").and_then(Value::as_u64).unwrap_or(0),
+            )
+        };
+        let videos: Vec<Value> = adaptive
             .iter()
             .filter(|f| {
-                f.get("audioQuality").is_some()
-                    && f.get("height")
-                        .and_then(Value::as_u64)
-                        .map(|h| h <= quality as u64)
+                usable(f)
+                    && f.get("mimeType")
+                        .and_then(Value::as_str)
+                        .map(|m| m.starts_with("video/"))
                         .unwrap_or(false)
             })
-            .max_by_key(|f| f.get("height").and_then(Value::as_u64).unwrap_or(0));
-
-        if let Some(fmt) = progressive {
-            let url = fmt
-                .get("url")
-                .and_then(Value::as_str)
-                .ok_or("youtube: format url missing")?;
-            let progress = Arc::new(Mutex::new(Box::new({
-                let on_progress = self.on_progress.clone();
-                move |p: u8| {
-                    let mut f = on_progress.lock().unwrap();
-                    (f)(p);
-                }
-            }) as Box<dyn FnMut(u8) + Send>));
-            self.http
-                .download_file(url, &dest, &[], &self.cancel, progress)?;
-            return Ok(vec![dest]);
-        }
-
-        // Fallback: best video + best audio (adaptive), then merge.
-        let videos: Vec<Value> = formats
+            .cloned()
+            .collect();
+        let audios: Vec<Value> = adaptive
             .iter()
             .filter(|f| {
-                f.get("mimeType")
-                    .and_then(Value::as_str)
-                    .map(|m| m.starts_with("video/"))
-                    .unwrap_or(false)
+                usable(f)
+                    && f.get("mimeType")
+                        .and_then(Value::as_str)
+                        .map(|m| m.starts_with("audio/"))
+                        .unwrap_or(false)
             })
             .cloned()
             .collect();
-        let audios: Vec<Value> = formats
-            .iter()
-            .filter(|f| {
-                f.get("mimeType")
-                    .and_then(Value::as_str)
-                    .map(|m| m.starts_with("audio/"))
-                    .unwrap_or(false)
-            })
-            .cloned()
-            .collect();
+
         let best_video = videos
             .iter()
-            .filter(|v| {
-                v.get("height")
-                    .and_then(Value::as_u64)
-                    .map(|h| h <= quality as u64)
-                    .unwrap_or(false)
-            })
-            .max_by_key(|v| v.get("height").and_then(Value::as_u64).unwrap_or(0))
-            .or_else(|| {
-                videos
-                    .iter()
-                    .max_by_key(|v| v.get("height").and_then(Value::as_u64).unwrap_or(0))
-            })
-            .cloned()
-            .ok_or("youtube: no suitable video format")?;
+            .filter(|v| video_key(v).0 > 0 && video_key(v).0 <= quality as u64)
+            .max_by_key(|v| video_key(v))
+            .or_else(|| videos.iter().max_by_key(|v| video_key(v)))
+            .cloned();
         let best_audio = audios
             .iter()
             .max_by_key(|a| a.get("bitrate").and_then(Value::as_u64).unwrap_or(0))
-            .cloned()
-            .ok_or("youtube: no audio format")?;
+            .cloned();
 
-        let video_url = best_video
-            .get("url")
-            .and_then(Value::as_str)
-            .ok_or("youtube: video url missing")?;
-        let audio_url = best_audio
-            .get("url")
-            .and_then(Value::as_str)
-            .ok_or("youtube: audio url missing")?;
+        if let (Some(best_video), Some(best_audio)) = (best_video, best_audio) {
+            let video_url = youtube_format_url(&best_video)?;
+            let audio_url = youtube_format_url(&best_audio)?;
 
-        let tmp_video = dest.with_extension("video.m4v");
-        let tmp_audio = dest.with_extension("audio.m4a");
-        let video_progress = Arc::new(Mutex::new(Box::new({
-            let on_progress = self.on_progress.clone();
-            move |p: u8| {
-                let mut f = on_progress.lock().unwrap();
-                (f)(p / 2);
+            let tmp_video = dest.with_extension("video.m4v");
+            let tmp_audio = dest.with_extension("audio.m4a");
+            let mut v_headers: Vec<(&'static str, String)> = Vec::new();
+            if let Some(pair) = self.cookie_pair(&video_url) {
+                v_headers.push(pair);
             }
-        }) as Box<dyn FnMut(u8) + Send>));
-        self.http
-            .download_file(video_url, &tmp_video, &[], &self.cancel, video_progress)?;
-        let audio_progress = Arc::new(Mutex::new(Box::new({
-            let on_progress = self.on_progress.clone();
-            move |p: u8| {
-                let mut f = on_progress.lock().unwrap();
-                (f)(50 + p * 3 / 10);
+            let v_headers_ref: Vec<(&str, &str)> =
+                v_headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            let video_progress = Arc::new(Mutex::new(Box::new({
+                let on_progress = self.on_progress.clone();
+                move |p: u8| {
+                    let mut f = on_progress.lock().unwrap();
+                    (f)(p / 2);
+                }
+            }) as Box<dyn FnMut(u8) + Send>));
+            self.http.download_file(
+                &video_url,
+                &tmp_video,
+                &v_headers_ref,
+                &self.cancel,
+                video_progress,
+            )?;
+            let mut a_headers: Vec<(&'static str, String)> = Vec::new();
+            if let Some(pair) = self.cookie_pair(&audio_url) {
+                a_headers.push(pair);
             }
-        }) as Box<dyn FnMut(u8) + Send>));
-        self.http
-            .download_file(audio_url, &tmp_audio, &[], &self.cancel, audio_progress)?;
-        self.progress(80);
-
-        let mut cmd = std::process::Command::new(&self.ffmpeg);
-        cmd.arg("-y")
-            .arg("-i")
-            .arg(&tmp_video)
-            .arg("-i")
-            .arg(&tmp_audio)
-            .arg("-c")
-            .arg("copy")
-            .arg("-movflags")
-            .arg("+faststart")
-            .arg(&dest);
-        crate::pipeline::hide_console(&mut cmd);
-        let out = cmd.output().map_err(|e| format!("ffmpeg: {e}"))?;
-        let _ = std::fs::remove_file(&tmp_video);
-        let _ = std::fs::remove_file(&tmp_audio);
-        if !out.status.success() {
-            let _ = std::fs::remove_file(&dest);
-            return Err(format!(
-                "ffmpeg merge failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
+            let a_headers_ref: Vec<(&str, &str)> =
+                a_headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            let audio_progress = Arc::new(Mutex::new(Box::new({
+                let on_progress = self.on_progress.clone();
+                move |p: u8| {
+                    let mut f = on_progress.lock().unwrap();
+                    (f)(50 + p * 3 / 10);
+                }
+            }) as Box<dyn FnMut(u8) + Send>));
+            self.http.download_file(
+                &audio_url,
+                &tmp_audio,
+                &a_headers_ref,
+                &self.cancel,
+                audio_progress,
+            )?;
+            self.progress(80);
+            self.merge_av(&tmp_video, Some(tmp_audio), &dest)?;
+            self.progress(100);
+            return Ok(vec![dest]);
         }
+
+        // Fallback: best progressive (muxed) format at the requested quality.
+        let progressive_key = |f: &Value| f.get("height").and_then(Value::as_u64).unwrap_or(0);
+        let progressive = muxed
+            .iter()
+            .filter(|f| {
+                usable(f)
+                    && f.get("audioQuality").is_some()
+                    && progressive_key(f) > 0
+                    && progressive_key(f) <= quality as u64
+            })
+            .max_by_key(|f| progressive_key(f))
+            .or_else(|| muxed.iter().filter(|f| usable(f)).max_by_key(|f| progressive_key(f)))
+            .ok_or("youtube: no suitable video format")?;
+        let fmt_url = youtube_format_url(progressive)?;
+        let mut headers: Vec<(&'static str, String)> = Vec::new();
+        if let Some(pair) = self.cookie_pair(&fmt_url) {
+            headers.push(pair);
+        }
+        let headers_ref: Vec<(&str, &str)> =
+            headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        self.http.download_file(
+            &fmt_url,
+            &dest,
+            &headers_ref,
+            &self.cancel,
+            self.on_progress.clone(),
+        )?;
         self.progress(100);
         Ok(vec![dest])
     }
 
-    /// YouTube Innertube player response (no login, no PO token).
-    /// Mirrors `YoutubeIE._extract_player_responses` with `visionos` + `web` fallback.
+    /// YouTube Innertube player response. Mirrors yt-dlp's default client list
+    /// `('visionos', 'web')`: visionOS is tried first (JS-less, no PO token),
+    /// then the web client with cookies + SAPISIDHASH authorization when
+    /// available. Client identification headers and the visitor id from a
+    /// previous response are sent like `generate_api_headers` does.
     fn youtube_player_response(&self, video_id: &str) -> Result<Value, String> {
-        // Try the lightweight clients first (they do not require a PO token).
+        struct YtClient {
+            name: &'static str,
+            context: Value,
+            client_name_id: u32,
+            version: &'static str,
+            /// yt-dlp sends the client's own User-Agent when its context has one.
+            user_agent: Option<&'static str>,
+            /// yt-dlp SUPPORTS_COOKIES: only these clients get cookies + auth.
+            supports_cookies: bool,
+        }
         let clients = [
-            (
-                "visionos",
-                serde_json::json!({
+            YtClient {
+                name: "visionos",
+                context: serde_json::json!({
                     "clientName": "VISIONOS",
                     "clientVersion": "1.02",
                     "deviceMake": "Apple",
                     "deviceModel": "RealityDevice17,1",
+                    "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15",
                     "osName": "visionOS",
                     "osVersion": "26.5.23O471",
                     "hl": "en",
                     "timeZone": "UTC",
                     "utcOffsetMinutes": 0,
                 }),
-            ),
-            (
-                "web",
-                serde_json::json!({
+                client_name_id: 101,
+                version: "1.02",
+                user_agent: Some("Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15"),
+                supports_cookies: false,
+            },
+            YtClient {
+                name: "web",
+                context: serde_json::json!({
                     "clientName": "WEB",
                     "clientVersion": "2.20260708.00.00",
                     "hl": "en",
                     "timeZone": "UTC",
                     "utcOffsetMinutes": 0,
                 }),
-            ),
+                client_name_id: 1,
+                version: "2.20260708.00.00",
+                user_agent: None,
+                supports_cookies: true,
+            },
         ];
         let mut last_err = String::new();
-        for (name, client) in &clients {
+        let mut visitor_data: Option<String> = None;
+        for client in &clients {
+            let mut headers: Vec<(&str, String)> = vec![
+                ("Origin", "https://www.youtube.com".into()),
+                ("Referer", "https://www.youtube.com/".into()),
+                ("X-YouTube-Client-Name", client.client_name_id.to_string()),
+                ("X-YouTube-Client-Version", client.version.into()),
+            ];
+            if let Some(ua) = client.user_agent {
+                headers.push(("User-Agent", ua.into()));
+            }
+            if let Some(vd) = &visitor_data {
+                headers.push(("X-Goog-Visitor-Id", vd.clone()));
+            }
+            if client.supports_cookies {
+                if let Some(pair) = self.cookie_pair("https://www.youtube.com/") {
+                    headers.push(pair);
+                }
+                if let Some(auth) = self.sid_authorization() {
+                    headers.push(("Authorization", auth));
+                    headers.push(("X-Origin", "https://www.youtube.com".into()));
+                }
+            }
+            let headers_ref: Vec<(&str, &str)> =
+                headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+
             let body = serde_json::json!({
                 "videoId": video_id,
-                "context": { "client": client },
+                "context": { "client": client.context },
             });
             match self.http.post_json(
-                &format!("https://www.youtube.com/youtubei/v1/player?prettyPrint=false"),
+                "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
                 &body,
-                &[
-                    ("Origin", "https://www.youtube.com"),
-                    ("Referer", "https://www.youtube.com/"),
-                ],
+                &headers_ref,
             ) {
                 Ok(pr) => {
+                    if visitor_data.is_none() {
+                        visitor_data = pr
+                            .pointer("/responseContext/visitorData")
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+                    }
                     let status = pr
                         .pointer("/playabilityStatus/status")
                         .and_then(Value::as_str)
@@ -1072,9 +1495,9 @@ impl Downloader {
                         .pointer("/playabilityStatus/reason")
                         .and_then(Value::as_str)
                         .unwrap_or("unknown");
-                    last_err = format!("{name} client: playability {status} ({reason})");
+                    last_err = format!("{} client: playability {status} ({reason})", client.name);
                 }
-                Err(e) => last_err = format!("{name} client: {e}"),
+                Err(e) => last_err = format!("{} client: {e}", client.name),
             }
         }
         Err(format!("youtube player response failed: {last_err}"))
@@ -1084,6 +1507,68 @@ impl Downloader {
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
+
+/// Range-chunk size for media downloads (yt-dlp uses 10 MiB chunks too).
+const DL_CHUNK_SIZE: u64 = 10 * 1024 * 1024;
+/// Per-chunk retry attempts (yt-dlp's default --retries is higher; 3 keeps
+/// the UI wait bounded).
+const DL_MAX_ATTEMPTS: u32 = 3;
+
+/// Stable `.part` file path for a media URL, so interrupted downloads can be
+/// resumed (yt-dlp resumes `.part` files the same way). Keyed by the URL
+/// because a re-signed URL may point at different content (other quality).
+fn part_path(url: &str) -> PathBuf {
+    // FNV-1a 64
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in url.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    std::env::temp_dir().join(format!("liveneko_dl_{h:016x}.part"))
+}
+
+/// Host portion of a URL (no scheme, no path).
+fn host_of(url: &str) -> &str {
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    rest.split(['/', '?', '#']).next().unwrap_or(rest)
+}
+
+/// Case-insensitive header lookup in a raw header block; returns the value.
+fn strip_header<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+    let (k, v) = line.split_once(':')?;
+    if k.trim().eq_ignore_ascii_case(name) {
+        Some(v.trim())
+    } else {
+        None
+    }
+}
+
+/// yt-dlp `_make_sid_authorization`: sha1("<timestamp> <sid> <origin>").
+fn sha1_hex(data: &str) -> String {
+    use sha1::{Digest, Sha1};
+    let mut hasher = Sha1::new();
+    hasher.update(data.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Resolve a YouTube format's media URL. Formats without a plain `url` carry
+/// `signatureCipher`, which needs the player's JavaScript to decrypt — a
+/// limitation shared with yt-dlp running without a JS runtime.
+fn youtube_format_url(format: &Value) -> Result<String, String> {
+    if let Some(u) = format.get("url").and_then(Value::as_str) {
+        return Ok(u.to_string());
+    }
+    if format.get("signatureCipher").is_some() {
+        return Err(
+            "youtube: the selected client returned encrypted stream URLs (signatureCipher) and no direct link; try again later or enable browser cookies in Settings".into(),
+        );
+    }
+    Err("youtube: format url missing".into())
+}
 
 /// Resolved Bilibili video metadata (from the view API or the HTML page).
 struct BiliMeta {
@@ -1267,7 +1752,71 @@ mod tests {
             Arc::new(Mutex::new(
                 Box::new(|l: String| eprintln!("  {l}")) as Box<dyn FnMut(String) + Send>
             )),
+            None,
         )
+    }
+
+    #[test]
+    fn test_part_path_is_stable_and_url_keyed() {
+        let a = part_path("https://example.com/a?x=1");
+        let b = part_path("https://example.com/a?x=1");
+        let c = part_path("https://example.com/a?x=2");
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert!(a.to_string_lossy().ends_with(".part"));
+    }
+
+    #[test]
+    fn test_host_of() {
+        assert_eq!(host_of("https://api.bilibili.com/x?y=1"), "api.bilibili.com");
+        assert_eq!(host_of("https://rr1---sn-x.googlevideo.com/videoplayback?n=a"), "rr1---sn-x.googlevideo.com");
+    }
+
+    #[test]
+    fn test_sha1_hex() {
+        // sha1("abc") from FIPS 180-1 test vectors
+        assert_eq!(sha1_hex("abc"), "a9993e364706816aba3e25717850c26c9cd0d89d");
+    }
+
+    #[test]
+    fn test_sid_authorization() {
+        use crate::cookies::Cookie;
+        let mk = |name: &str, value: &str| Cookie {
+            name: name.into(),
+            value: value.into(),
+            domain: ".youtube.com".into(),
+            path: "/".into(),
+            expires: None,
+            secure: true,
+        };
+        let silent = |_: u8| {};
+        let silent_log = |_: String| {};
+        let new_dl = |cookies: Option<Arc<Vec<Cookie>>>| {
+            Downloader::new(
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(Mutex::new(
+                    Box::new(silent) as Box<dyn FnMut(u8) + Send>
+                )),
+                Arc::new(Mutex::new(
+                    Box::new(silent_log) as Box<dyn FnMut(String) + Send>
+                )),
+                cookies,
+            )
+        };
+        // no cookies at all -> no auth header
+        assert!(new_dl(None).sid_authorization().is_none());
+        // cookies not matching youtube -> no auth header
+        assert!(new_dl(Some(Arc::new(vec![mk("SAPISID", "other")]))).sid_authorization().is_none());
+        // SAPISID + 3PAPISID -> SAPISIDHASH and SAPISID3PHASH, no 1PHASH
+        let auth = new_dl(Some(Arc::new(vec![
+            mk("SAPISID", "testSapisid123"),
+            mk("__Secure-3PAPISID", "third"),
+        ])))
+        .sid_authorization()
+        .unwrap();
+        assert_eq!(auth.matches("SAPISIDHASH").count(), 1);
+        assert!(!auth.contains("SAPISID1PHASH"));
+        assert!(auth.contains("SAPISID3PHASH"));
     }
 
     #[test]

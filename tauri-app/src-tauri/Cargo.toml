@@ -1,6 +1,6 @@
 [package]
 name = "liveneko"
-version = "0.1.5-d"
+version = "0.1.6"
 description = "LiveNeko multi-modal video summarization desktop app"
 authors = ["LiveNeko"]
 edition = "2024"
@@ -25,9 +25,20 @@ regex = "1.13.1"
 ndarray = "0.16"
 url = "2.5"
 deep_filter = { path = "../../DeepFilterNet/libDF", features = ["tract", "wav-utils", "transforms"] }
+# Browser cookie import (--cookies-from-browser equivalent): sqlite stores,
+# AES-GCM for Chromium v10 cookies, SHA-1 for YouTube SAPISIDHASH auth.
+rusqlite = { version = "0.32", features = ["bundled"] }
+aes-gcm = "0.10"
+sha1 = "0.10"
+base64 = "0.22"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+    "Win32_System_Memory",
+] }
 
 [profile.release]
 codegen-units = 1

@@ -97,6 +97,99 @@
           </div>
 
           <div class="card">
+            <h2 data-i18n="settings.funasrTitle">FunASR audio models</h2>
+            <p class="hint" data-i18n="settings.funasrHint">FunASR models are not bundled with the app. Pick a local model directory, or download one from Hugging Face / ModelScope and validate it. ASR and VAD models are required; the SPK model is optional.</p>
+
+            <h3 data-i18n="settings.asrTitle">ASR model</h3>
+            <div class="row">
+              <label class="wide"><span data-i18n="settings.modelType">Model type</span>
+                <select id="cfg-asr-type">
+                  <option value="sensevoice-small">SenseVoiceSmall</option>
+                  <option value="fun-asr-nano">Fun-ASR-Nano</option>
+                  <option value="paraformer-zh-streaming">Paraformer-zh-streaming</option>
+                  <option value="qwen3-api">Qwen3-ASR (online API)</option>
+                </select>
+              </label>
+            </div>
+            <div id="asr-local-settings" class="sub-card">
+              <div class="row">
+                <label class="wide"><span data-i18n="settings.modelSource">Source</span>
+                  <select id="cfg-asr-source">
+                    <option value="local" data-i18n="settings.sourceLocal">Local directory</option>
+                    <option value="huggingface">Hugging Face</option>
+                    <option value="modelscope">ModelScope</option>
+                  </select>
+                </label>
+              </div>
+              <div class="row" id="asr-download-row">
+                <input id="cfg-asr-id" type="text" data-i18n-placeholder="settings.modelIdPlaceholder" placeholder="Repo id (e.g. FunAudioLLM/SenseVoiceSmall)" />
+                <button id="btn-download-asr" class="btn" data-i18n="settings.download">Download</button>
+              </div>
+              <div class="row">
+                <input id="cfg-asr-dir" type="text" data-i18n-placeholder="settings.asrDirPlaceholder" placeholder="Path to the ASR model directory" />
+                <button id="btn-browse-asr" class="btn" data-i18n="settings.browse">Browse…</button>
+                <button id="btn-validate-asr" class="btn ghost small" data-i18n="settings.validate">Validate</button>
+                <span id="asr-status" class="hint"></span>
+              </div>
+              <div class="row"><label class="wide"><span data-i18n="settings.languageOptional">Language hint</span> <input id="cfg-asr-language" type="text" data-i18n-placeholder="settings.languagePlaceholder" placeholder="optional (zh / en / auto)" /></label></div>
+            </div>
+            <div id="asr-api-settings" class="sub-card hidden">
+              <div class="row"><label class="wide"><span data-i18n="settings.baseUrl">Base URL</span> <input id="cfg-qwen3-base" type="text" placeholder="https://dashscope.aliyuncs.com/compatible-mode/v1" /></label></div>
+              <div class="row"><label class="wide"><span data-i18n="settings.apiKey">API Key</span> <input id="cfg-qwen3-key" type="password" placeholder="sk-…" /></label></div>
+              <div class="row"><label class="wide"><span data-i18n="settings.model">Model</span> <input id="cfg-qwen3-model" type="text" placeholder="qwen3-asr-flash" /></label></div>
+              <div class="row"><label class="wide"><span data-i18n="settings.languageOptional">Language hint</span> <input id="cfg-qwen3-language" type="text" data-i18n-placeholder="settings.languagePlaceholder" placeholder="optional (zh / en / auto)" /></label></div>
+              <div class="row"><button id="btn-test-asr-api" class="btn small" data-i18n="settings.testConnection">Test connection</button><span id="asr-api-status" class="hint"></span></div>
+            </div>
+
+            <h3 data-i18n="settings.vadTitle">VAD model (fsmn-vad)</h3>
+            <div class="sub-card">
+              <div class="row">
+                <label class="wide"><span data-i18n="settings.modelSource">Source</span>
+                  <select id="cfg-vad-source">
+                    <option value="local" data-i18n="settings.sourceLocal">Local directory</option>
+                    <option value="huggingface">Hugging Face</option>
+                    <option value="modelscope">ModelScope</option>
+                  </select>
+                </label>
+              </div>
+              <div class="row" id="vad-download-row">
+                <input id="cfg-vad-id" type="text" data-i18n-placeholder="settings.modelIdPlaceholder" placeholder="Repo id (e.g. funasr/fsmn-vad)" />
+                <button id="btn-download-vad" class="btn" data-i18n="settings.download">Download</button>
+              </div>
+              <div class="row">
+                <input id="cfg-vad-dir" type="text" data-i18n-placeholder="settings.vadDirPlaceholder" placeholder="Path to the fsmn-vad model directory" />
+                <button id="btn-browse-vad" class="btn" data-i18n="settings.browse">Browse…</button>
+                <button id="btn-validate-vad" class="btn ghost small" data-i18n="settings.validate">Validate</button>
+                <span id="vad-status" class="hint"></span>
+              </div>
+            </div>
+
+            <h3 data-i18n="settings.spkModelTitle">SPK model (cam++, optional)</h3>
+            <div class="row"><label class="inline"><input type="checkbox" id="cfg-spk-model-enabled" /> <span data-i18n="settings.spkModelEnable">Use a SPK model for speaker identification</span></label></div>
+            <div id="spk-model-settings" class="sub-card hidden">
+              <div class="row">
+                <label class="wide"><span data-i18n="settings.modelSource">Source</span>
+                  <select id="cfg-spk-source">
+                    <option value="local" data-i18n="settings.sourceLocal">Local directory</option>
+                    <option value="huggingface">Hugging Face</option>
+                    <option value="modelscope">ModelScope</option>
+                  </select>
+                </label>
+              </div>
+              <div class="row" id="spk-download-row">
+                <input id="cfg-spk-id" type="text" data-i18n-placeholder="settings.modelIdPlaceholder" placeholder="Repo id (e.g. funasr/campplus)" />
+                <button id="btn-download-spk" class="btn" data-i18n="settings.download">Download</button>
+              </div>
+              <div class="row">
+                <input id="cfg-spk-dir" type="text" data-i18n-placeholder="settings.spkDirPlaceholder" placeholder="Path to the cam++ model directory" />
+                <button id="btn-browse-spk" class="btn" data-i18n="settings.browse">Browse…</button>
+                <button id="btn-validate-spk" class="btn ghost small" data-i18n="settings.validate">Validate</button>
+                <span id="spk-status" class="hint"></span>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
             <h2 data-i18n="settings.videonekoTitle">VideoNeko Model (visual)</h2>
             <p class="hint" data-i18n="settings.videonekoHint">Your fine-tuned ViT model weights directory (must contain config.json, model.safetensors, preprocessor_config.json).</p>
             <div class="row">
@@ -220,6 +313,53 @@
             <div class="setup-step">
               <span class="step-num">1</span>
               <div class="step-body">
+                <strong data-i18n="setup.stepFunasr">Configure FunASR audio models</strong>
+                <p class="hint" data-i18n="setup.stepFunasrHint">ASR and VAD models are not bundled. Choose a model type and download it from Hugging Face / ModelScope, or pick an existing local directory.</p>
+                <div class="row">
+                  <label class="wide"><span data-i18n="settings.modelType">Model type</span>
+                    <select id="setup-asr-type">
+                      <option value="sensevoice-small">SenseVoiceSmall</option>
+                      <option value="fun-asr-nano">Fun-ASR-Nano</option>
+                      <option value="paraformer-zh-streaming">Paraformer-zh-streaming</option>
+                      <option value="qwen3-api">Qwen3-ASR (online API)</option>
+                    </select>
+                  </label>
+                </div>
+                <div id="setup-asr-local">
+                  <div class="row">
+                    <label class="wide"><span data-i18n="settings.modelSource">Source</span>
+                      <select id="setup-asr-source">
+                        <option value="local" data-i18n="settings.sourceLocal">Local directory</option>
+                        <option value="huggingface">Hugging Face</option>
+                        <option value="modelscope">ModelScope</option>
+                      </select>
+                    </label>
+                  </div>
+                  <div class="row">
+                    <input id="setup-asr-id" type="text" data-i18n-placeholder="settings.modelIdPlaceholder" placeholder="Repo id (e.g. FunAudioLLM/SenseVoiceSmall)" />
+                    <button id="setup-download-asr" class="btn" data-i18n="settings.download">Download</button>
+                  </div>
+                </div>
+                <div id="setup-asr-api" class="hidden">
+                  <div class="row"><input id="setup-qwen3-base" type="text" placeholder="https://dashscope.aliyuncs.com/compatible-mode/v1" /></div>
+                  <div class="row"><input id="setup-qwen3-key" type="password" data-i18n-placeholder="settings.apiKey" placeholder="API Key" /></div>
+                  <div class="row"><input id="setup-qwen3-model" type="text" placeholder="qwen3-asr-flash" /></div>
+                </div>
+                <div class="row" id="setup-asr-dir-row">
+                  <input id="setup-asr-dir" type="text" data-i18n-placeholder="settings.asrDirPlaceholder" placeholder="Path to the ASR model directory" />
+                  <button id="setup-browse-asr" class="btn" data-i18n="settings.browse">Browse…</button>
+                </div>
+                <div class="row" id="setup-vad-row">
+                  <input id="setup-vad-dir" type="text" data-i18n-placeholder="settings.vadDirPlaceholder" placeholder="Path to the fsmn-vad model directory" />
+                  <button id="setup-browse-vad" class="btn" data-i18n="settings.browse">Browse…</button>
+                  <button id="setup-download-vad" class="btn ghost small" data-i18n="setup.downloadVad">Download fsmn-vad</button>
+                </div>
+                <span id="setup-funasr-status" class="hint"></span>
+              </div>
+            </div>
+            <div class="setup-step">
+              <span class="step-num">2</span>
+              <div class="step-body">
                 <strong data-i18n="setup.step1">Select your VideoNeko model weights</strong>
                 <p class="hint" data-i18n="setup.step1Hint">Browse for the directory containing your fine-tuned ViT weights (config.json, model.safetensors, preprocessor_config.json).</p>
                 <div class="row">
@@ -229,7 +369,7 @@
               </div>
             </div>
             <div class="setup-step">
-              <span class="step-num">2</span>
+              <span class="step-num">3</span>
               <div class="step-body">
                 <strong data-i18n="setup.step2">Choose a summarization engine</strong>
                 <p class="hint" data-i18n="setup.step2Hint">Select where the summary LLM runs: a hosted OpenAI-compatible API, a local Ollama server, or a llama.cpp server.</p>

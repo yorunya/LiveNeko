@@ -60,6 +60,8 @@ const state = {
   running: false,
   results: [],
   activeResult: null,
+  // last FunASR model validation report (from validate_model_config)
+  modelReport: null,
   // freshly picked (not yet saved) speaker reference WAV source path
   speakerWav: "",
 };
@@ -119,12 +121,41 @@ const I18N = {
     "settings.languageSystem": "System default",
     "settings.envTitle": "Environment Check",
     "settings.recheck": "Re-check environment",
+    "settings.funasrTitle": "FunASR audio models",
+    "settings.funasrHint": "FunASR models are not bundled with the app. Pick a local model directory, or download one from Hugging Face / ModelScope. ASR and VAD models are required; the SPK model is optional.",
+    "settings.asrTitle": "ASR model",
+    "settings.vadTitle": "VAD model (fsmn-vad)",
+    "settings.spkModelTitle": "SPK model (cam++, optional)",
+    "settings.spkModelEnable": "Use a SPK model for speaker identification",
+    "settings.modelType": "Model type",
+    "settings.modelSource": "Source",
+    "settings.sourceLocal": "Local directory",
+    "settings.modelIdPlaceholder": "Repo id (e.g. FunAudioLLM/SenseVoiceSmall)",
+    "settings.asrDirPlaceholder": "Path to the ASR model directory",
+    "settings.vadDirPlaceholder": "Path to the fsmn-vad model directory",
+    "settings.spkDirPlaceholder": "Path to the cam++ model directory",
+    "settings.languageOptional": "Language hint",
+    "settings.languagePlaceholder": "optional (zh / en / auto)",
+    "settings.download": "Download",
+    "settings.validate": "Validate",
+    "settings.valid": "valid ✓",
+    "settings.invalid": "invalid",
+    "settings.skipped": "not configured (optional)",
+    "settings.validating": "Validating…",
+    "settings.downloading": "Downloading…",
+    "settings.downloadDone": "Downloaded ✓",
+    "settings.downloadFailed": "Download failed:",
+    "settings.downloadNeedsHub": "Choose Hugging Face or ModelScope as the source first.",
+    "settings.modelsOk": "FunASR models OK ✓",
+    "settings.spkDisabledHint": "Speaker identification is disabled until a SPK model is configured.",
+    "env.downloadLibs": "Model download tools",
+    "env.downloadLibsMissing": "missing — model downloads unavailable",
     "settings.videonekoTitle": "Visual Model",
     "settings.videonekoHint": "Visual model directory (must contain config.json, model.safetensors, preprocessor_config.json).",
     "settings.videonekoPlaceholder": "Path to VideoNeko model directory",
     "settings.browse": "Browse…",
     "settings.speakerTitle": "Speaker identification",
-    "settings.speakerHint": "Optionally tag transcript lines with a specific speaker. Choose a short reference WAV clip of that speaker's voice (a few seconds of clean speech); it is converted to 16 kHz automatically if needed.",
+    "settings.speakerHint": "Optionally tag transcript lines with a specific speaker. Requires a cam++ SPK model above; choose a short reference WAV clip of that speaker's voice (a few seconds of clean speech); it is converted to 16 kHz automatically if needed.",
     "settings.speakerEnable": "Identify a specific speaker",
     "settings.speakerName": "Speaker name",
     "settings.speakerNamePlaceholder": "e.g. taffy",
@@ -163,6 +194,7 @@ const I18N = {
     "settings.resetFailed": "Reset failed:",
     "settings.testing": "Testing…",
     "settings.connectionOk": "Connection OK ✓",
+    "settings.connectionOkProbe": "Credentials verified ✓ — the model rejected the silent probe clip (some models need ~2s of real speech).",
     "settings.connectionFailed": "Failed",
     "status.ready": "Ready.",
     "status.checkingEnv": "Checking environment…",
@@ -194,7 +226,7 @@ const I18N = {
     "log.cancelled": "cancelled",
     "log.failed": "failed:",
     "setup.welcome": "Welcome to LiveNeko 👋",
-    "setup.hint": "Let's get everything configured. Complete the steps below — the pipeline needs your VideoNeko model and a summarization engine.",
+    "setup.hint": "Let's get everything configured. Complete the steps below — the pipeline needs FunASR audio models (ASR/VAD), your VideoNeko model and a summarization engine.",
     "setup.step1": "Select your VideoNeko model weights",
     "setup.step1Hint": "Browse for the directory containing your fine-tuned ViT weights (config.json, model.safetensors, preprocessor_config.json).",
     "setup.step2": "Choose a summarization engine",
@@ -212,6 +244,10 @@ const I18N = {
     "setup.llamacppModel": "Model name or GGUF path",
     "setup.skip": "Skip for now",
     "setup.finish": "Finish Setup",
+    "setup.stepFunasr": "Configure FunASR audio models",
+    "setup.stepFunasrHint": "ASR and VAD models are not bundled. Choose a model type and download it from Hugging Face / ModelScope, or pick an existing local directory.",
+    "setup.downloadVad": "Download fsmn-vad",
+    "setup.funasrIncomplete": "FunASR models are not ready:",
   },
   zh: {
     "tab.pipeline": "分析",
@@ -266,12 +302,41 @@ const I18N = {
     "settings.languageSystem": "跟随系统",
     "settings.envTitle": "环境检查",
     "settings.recheck": "重新检查环境",
+    "settings.funasrTitle": "FunASR 语音模型",
+    "settings.funasrHint": "应用不再内置 FunASR 模型。请选择本地模型目录，或从 Hugging Face / ModelScope 下载。ASR 与 VAD 模型为必填，SPK 模型可选。",
+    "settings.asrTitle": "ASR 模型",
+    "settings.vadTitle": "VAD 模型（fsmn-vad）",
+    "settings.spkModelTitle": "SPK 模型（cam++，可选）",
+    "settings.spkModelEnable": "启用 SPK 模型进行说话人识别",
+    "settings.modelType": "模型类型",
+    "settings.modelSource": "来源",
+    "settings.sourceLocal": "本地目录",
+    "settings.modelIdPlaceholder": "仓库 ID（如 FunAudioLLM/SenseVoiceSmall）",
+    "settings.asrDirPlaceholder": "ASR 模型目录路径",
+    "settings.vadDirPlaceholder": "fsmn-vad 模型目录路径",
+    "settings.spkDirPlaceholder": "cam++ 模型目录路径",
+    "settings.languageOptional": "语言提示",
+    "settings.languagePlaceholder": "可选（zh / en / auto）",
+    "settings.download": "下载",
+    "settings.validate": "校验",
+    "settings.valid": "有效 ✓",
+    "settings.invalid": "无效",
+    "settings.skipped": "未配置（可选）",
+    "settings.validating": "校验中…",
+    "settings.downloading": "下载中…",
+    "settings.downloadDone": "下载完成 ✓",
+    "settings.downloadFailed": "下载失败：",
+    "settings.downloadNeedsHub": "请先将来源切换为 Hugging Face 或 ModelScope。",
+    "settings.modelsOk": "FunASR 模型正常 ✓",
+    "settings.spkDisabledHint": "未配置 SPK 模型时将禁用说话人识别。",
+    "env.downloadLibs": "模型下载工具",
+    "env.downloadLibsMissing": "缺失 — 无法下载模型",
     "settings.videonekoTitle": "视觉模型",
     "settings.videonekoHint": "视觉模型目录（需包含 config.json、model.safetensors、preprocessor_config.json）。",
     "settings.videonekoPlaceholder": "视觉模型目录路径",
     "settings.browse": "浏览…",
     "settings.speakerTitle": "说话人识别",
-    "settings.speakerHint": "可选：在转写结果中用指定说话人标注语句。请提供该说话人声音的参考 WAV 片段（几秒清晰语音即可）；如不是 16 kHz 会自动转换。",
+    "settings.speakerHint": "可选：在转写结果中用指定说话人标注语句（需先在上方配置 cam++ SPK 模型）。请提供该说话人声音的参考 WAV 片段（几秒清晰语音即可）；如不是 16 kHz 会自动转换。",
     "settings.speakerEnable": "识别指定说话人",
     "settings.speakerName": "说话人名称",
     "settings.speakerNamePlaceholder": "例如 taffy",
@@ -310,6 +375,7 @@ const I18N = {
     "settings.resetFailed": "重置失败：",
     "settings.testing": "测试中…",
     "settings.connectionOk": "连接正常 ✓",
+    "settings.connectionOkProbe": "凭证已验证 ✓ — 模型拒绝了静音测试片段（部分模型需要约 2 秒真实语音）。",
     "settings.connectionFailed": "失败",
     "status.ready": "就绪。",
     "status.checkingEnv": "正在检查环境…",
@@ -341,7 +407,7 @@ const I18N = {
     "log.cancelled": "已取消",
     "log.failed": "失败：",
     "setup.welcome": "欢迎使用 LiveNeko 👋",
-    "setup.hint": "让我们完成配置。完成以下步骤——分析需要提供视觉模型和摘要引擎。",
+    "setup.hint": "让我们完成配置。完成以下步骤——分析需要提供 FunASR 语音模型（ASR/VAD）、视觉模型和摘要引擎。",
     "setup.step1": "选择视觉模型",
     "setup.step1Hint": "选择视觉模型目录（包括config.json、model.safetensors、preprocessor_config.json）。",
     "setup.step2": "选择摘要引擎",
@@ -359,6 +425,10 @@ const I18N = {
     "setup.llamacppModel": "模型名或 GGUF 路径",
     "setup.skip": "暂时跳过",
     "setup.finish": "完成设置",
+    "setup.stepFunasr": "配置 FunASR 语音模型",
+    "setup.stepFunasrHint": "应用不内置 ASR/VAD 模型。请选择模型类型并从 Hugging Face / ModelScope 下载，或选择本地目录。",
+    "setup.downloadVad": "下载 fsmn-vad",
+    "setup.funasrIncomplete": "FunASR 模型未就绪：",
   },
 };
 
@@ -557,17 +627,42 @@ function renderEnv() {
   const libVal = missing.length
     ? `${t("env.missingLibs")} ${missing.join(", ")}`
     : libs.torch + (libs.funasr ? " · funasr" : "");
+  const dl = e.downloadLibraries || {};
+  const dlNames = Object.keys(dl);
+  const dlMissing = dlNames.filter((k) => String(dl[k] ?? "").indexOf("missing") !== -1);
+  const dlVal = !dlNames.length
+    ? t("env.missing")
+    : dlMissing.length
+      ? `${t("env.downloadLibsMissing")}: ${dlMissing.join(", ")}`
+      : dlNames.map((k) => `${k} ${dl[k]}`).join(" · ");
   $("#env-status").innerHTML = [
     row(t("env.python"), e.python.ok, `${e.python.command} ${e.python.version}`),
     row(t("env.ffmpeg"), e.ffmpeg),
     row(t("env.cuda"), e.cuda),
     row(t("env.pythonLibs"), e.pythonLibraries, libVal),
+    row(t("env.downloadLibs"), dlNames.length > 0 && !dlMissing.length, dlVal),
   ].join("");
 }
 
 async function loadSettings() {
   state.config = await invoke("get_config");
   $("#cfg-videoneko").value = state.config.videonekoModelDir || "";
+  $("#cfg-asr-type").value = state.config.asrType || "sensevoice-small";
+  $("#cfg-asr-source").value = state.config.asrSource || "huggingface";
+  $("#cfg-asr-id").value = state.config.asrModelId || defaultModelId(state.config.asrType, state.config.asrSource);
+  $("#cfg-asr-dir").value = state.config.asrModelDir || "";
+  $("#cfg-asr-language").value = state.config.asrLanguage || "";
+  $("#cfg-vad-source").value = state.config.vadSource || "huggingface";
+  $("#cfg-vad-id").value = state.config.vadModelId || defaultModelId("fsmn-vad", state.config.vadSource);
+  $("#cfg-vad-dir").value = state.config.vadModelDir || "";
+  $("#cfg-spk-model-enabled").checked = !!(state.config.spkEnabled && (state.config.spkModelDir || "").trim());
+  $("#cfg-spk-source").value = state.config.spkSource || "huggingface";
+  $("#cfg-spk-id").value = state.config.spkModelId || defaultModelId("cam++", state.config.spkSource);
+  $("#cfg-spk-dir").value = state.config.spkModelDir || "";
+  $("#cfg-qwen3-base").value = state.config.qwen3BaseUrl || "";
+  $("#cfg-qwen3-key").value = state.config.qwen3ApiKey || "";
+  $("#cfg-qwen3-model").value = state.config.qwen3Model || "";
+  $("#cfg-qwen3-language").value = state.config.qwen3Language || "";
   $("#cfg-api-base").value = state.config.apiBaseUrl || "";
   $("#cfg-api-key").value = state.config.apiKey || "";
   $("#cfg-api-model").value = state.config.apiModel || "";
@@ -586,6 +681,10 @@ async function loadSettings() {
   setLanguage(state.config.language || "");
   setEngine(state.config.engine || "api");
   setQuality(state.config.downloadQuality || 720);
+  setAsrType(state.config.asrType || "sensevoice-small");
+  setHubRows();
+  setSpkModelSettings();
+  renderModelReport(state.modelReport);
   $("#cfg-cookie-browser").value = ["", "firefox", "chrome", "edge"].includes(state.config.cookieBrowser)
     ? state.config.cookieBrowser
     : "";
@@ -631,22 +730,126 @@ function setQuality(quality) {
   });
 }
 
-async function saveSettings() {
-  const engine = document.querySelector('input[name="engine"]:checked').value;
+// ---------- FunASR model configuration ----------
+const DEFAULT_MODEL_IDS = {
+  "sensevoice-small": { huggingface: "FunAudioLLM/SenseVoiceSmall", modelscope: "iic/SenseVoiceSmall" },
+  "fun-asr-nano": { huggingface: "FunAudioLLM/Fun-ASR-Nano-2512", modelscope: "FunAudioLLM/Fun-ASR-Nano-2512" },
+  "paraformer-zh-streaming": {
+    huggingface: "funasr/paraformer-zh-streaming",
+    modelscope: "iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online",
+  },
+  "fsmn-vad": { huggingface: "funasr/fsmn-vad", modelscope: "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch" },
+  "cam++": { huggingface: "funasr/campplus", modelscope: "iic/speech_campplus_sv_zh-cn_16k-common" },
+};
+
+function defaultModelId(kind, source) {
+  const entry = DEFAULT_MODEL_IDS[kind] || {};
+  return entry[source === "modelscope" ? "modelscope" : "huggingface"] || "";
+}
+
+function setAsrType(type) {
+  const isApi = type === "qwen3-api";
+  $("#asr-local-settings").classList.toggle("hidden", isApi);
+  $("#asr-api-settings").classList.toggle("hidden", !isApi);
+}
+
+function setHubRows() {
+  const pairs = [
+    ["#cfg-asr-source", "#asr-download-row"],
+    ["#cfg-vad-source", "#vad-download-row"],
+    ["#cfg-spk-source", "#spk-download-row"],
+  ];
+  for (const [sel, row] of pairs) {
+    $(row).classList.toggle("hidden", $(sel).value === "local");
+  }
+}
+
+function setSpkModelSettings() {
+  const enabled = $("#cfg-spk-model-enabled").checked;
+  $("#spk-model-settings").classList.toggle("hidden", !enabled);
+}
+
+function slotStatusText(item) {
+  if (!item) return "";
+  if (item.skipped) return t("settings.skipped");
+  if (item.ok) return t("settings.valid");
+  return `${t("settings.invalid")}: ${(item.errors || []).join("; ")}`;
+}
+
+function renderModelReport(report) {
+  if (!report) {
+    ["#asr-status", "#vad-status", "#spk-status"].forEach((sel) => { $(sel).textContent = ""; });
+    return;
+  }
+  const items = report.items || {};
+  $("#asr-status").textContent = slotStatusText(items.asr);
+  $("#vad-status").textContent = slotStatusText(items.vad);
+  $("#spk-status").textContent = slotStatusText(items.spk);
+}
+
+function browseDir(inputSel) {
+  open({ directory: true }).then((p) => { if (p) $(inputSel).value = p; });
+}
+
+async function downloadModel(kind, sourceSel, idInput, dirInput, statusEl) {
+  const source = $(sourceSel).value;
+  const modelId = $(idInput).value.trim();
+  if (source === "local") {
+    $(statusEl).textContent = t("settings.downloadNeedsHub");
+    return;
+  }
+  if (!modelId) {
+    $(statusEl).textContent = t("settings.downloadFailed");
+    return;
+  }
+  $(statusEl).textContent = t("settings.downloading");
+  try {
+    const r = await invoke("download_model", { kind, source, modelId });
+    $(dirInput).value = r.path || "";
+    $(statusEl).textContent = t("settings.downloadDone");
+  } catch (e) {
+    $(statusEl).textContent = `${t("settings.downloadFailed")} ${e}`;
+  }
+}
+
+async function validateModels() {
+  const config = collectConfig();
+  $("#save-status").textContent = t("settings.validating");
+  try {
+    const report = await invoke("validate_model_config", { config });
+    state.modelReport = report;
+    renderModelReport(report);
+    $("#save-status").textContent = report.ok ? t("settings.modelsOk") : t("settings.invalid");
+    setTimeout(() => ($("#save-status").textContent = ""), 2500);
+  } catch (e) {
+    $("#save-status").textContent = `${t("settings.saveError")} ${e}`;
+  }
+}
+
+async function testAsrApi() {
+  const el = $("#asr-api-status");
+  el.textContent = t("settings.testing");
+  try {
+    const r = await invoke("test_asr_connection", {
+      baseUrl: $("#cfg-qwen3-base").value.trim(),
+      apiKey: $("#cfg-qwen3-key").value.trim(),
+      model: $("#cfg-qwen3-model").value.trim(),
+      language: $("#cfg-qwen3-language").value.trim(),
+    });
+    el.textContent = r && r.warning === "probe_audio_rejected"
+      ? t("settings.connectionOkProbe")
+      : t("settings.connectionOk");
+  } catch (e) {
+    el.textContent = `${t("settings.connectionFailed")} ${e}`;
+  }
+}
+
+function collectConfig() {
+  const engine = document.querySelector('input[name="engine"]:checked')?.value || "api";
   const qualityInput = document.querySelector('input[name="quality"]:checked');
   const spkEnabled = $("#cfg-spk-enabled").checked;
   const spkName = spkEnabled ? $("#cfg-spk-name").value.trim() : "";
-  if (spkEnabled && !spkName) {
-    $("#save-status").textContent = t("settings.speakerNameRequired");
-    return;
-  }
-  // A speaker needs a reference WAV: either one picked in this session or the
-  // previously imported file (kept on the backend until the speaker changes).
-  if (spkEnabled && !state.speakerWav && !(state.config?.speakerRef || "").trim()) {
-    $("#save-status").textContent = t("settings.speakerWavRequired");
-    return;
-  }
-  const config = {
+  return {
     videonekoModelDir: $("#cfg-videoneko").value.trim(),
     engine,
     downloadQuality: qualityInput ? parseInt(qualityInput.value) || 720 : 720,
@@ -656,6 +859,23 @@ async function saveSettings() {
     speakerName: spkName,
     // keep the stored reference unless a new WAV was picked
     speakerRef: spkEnabled && !state.speakerWav ? state.config?.speakerRef || "" : "",
+    funasrModelsDir: state.config?.funasrModelsDir || "",
+    asrType: $("#cfg-asr-type").value,
+    asrSource: $("#cfg-asr-source").value,
+    asrModelId: $("#cfg-asr-id").value.trim(),
+    asrModelDir: $("#cfg-asr-dir").value.trim(),
+    asrLanguage: $("#cfg-asr-language").value.trim(),
+    vadSource: $("#cfg-vad-source").value,
+    vadModelId: $("#cfg-vad-id").value.trim(),
+    vadModelDir: $("#cfg-vad-dir").value.trim(),
+    spkEnabled: $("#cfg-spk-model-enabled").checked,
+    spkSource: $("#cfg-spk-source").value,
+    spkModelId: $("#cfg-spk-id").value.trim(),
+    spkModelDir: $("#cfg-spk-dir").value.trim(),
+    qwen3BaseUrl: $("#cfg-qwen3-base").value.trim(),
+    qwen3ApiKey: $("#cfg-qwen3-key").value.trim(),
+    qwen3Model: $("#cfg-qwen3-model").value.trim(),
+    qwen3Language: $("#cfg-qwen3-language").value.trim(),
     apiBaseUrl: $("#cfg-api-base").value.trim(),
     apiKey: $("#cfg-api-key").value.trim(),
     apiModel: $("#cfg-api-model").value.trim(),
@@ -670,6 +890,22 @@ async function saveSettings() {
     llamacppModel: $("#cfg-llamacpp-model").value.trim(),
     llamacppThinking: $("#cfg-llamacpp-thinking").checked,
   };
+}
+
+async function saveSettings() {
+  const spkEnabled = $("#cfg-spk-enabled").checked;
+  const spkName = spkEnabled ? $("#cfg-spk-name").value.trim() : "";
+  if (spkEnabled && !spkName) {
+    $("#save-status").textContent = t("settings.speakerNameRequired");
+    return;
+  }
+  // A speaker needs a reference WAV: either one picked in this session or the
+  // previously imported file (kept on the backend until the speaker changes).
+  if (spkEnabled && !state.speakerWav && !(state.config?.speakerRef || "").trim()) {
+    $("#save-status").textContent = t("settings.speakerWavRequired");
+    return;
+  }
+  const config = collectConfig();
   try {
     await invoke("save_config", { config, speakerWav: state.speakerWav || null });
     state.speakerWav = "";
@@ -867,6 +1103,14 @@ async function wireEvents() {
   await listen("pipeline://log", (e) => {
     appendLog(e.payload.line);
   });
+  await listen("model://progress", (e) => {
+    const { kind, progress } = e.payload || {};
+    const el = { asr: "#asr-status", vad: "#vad-status", spk: "#spk-status" }[kind];
+    if (el) $(el).textContent = `${t("settings.downloading")} ${progress}%`;
+    if (!$("#setup-modal").classList.contains("hidden")) {
+      $("#setup-funasr-status").textContent = `${t("settings.downloading")} ${progress}%`;
+    }
+  });
   await listen("pipeline://stage", (e) => {
     const { itemId, stage, progress, part, totalParts } = e.payload;
     updateItemStage(itemId, stage, progress, part, totalParts);
@@ -1010,15 +1254,33 @@ async function testApi() {
 async function checkSetup() {
   try {
     const s = await invoke("get_setup_status");
-    if (s.firstLaunch || s.needsVideoneko) {
+    if (s.firstLaunch || s.needsVideoneko || s.needsFunasr) {
       $("#setup-modal").classList.remove("hidden");
+      const cfg = state.config || {};
       $("#setup-videoneko").value = s.videonekoModelDir || "";
+      $("#setup-asr-type").value = cfg.asrType || "sensevoice-small";
+      $("#setup-asr-source").value = cfg.asrSource || "huggingface";
+      $("#setup-asr-id").value = cfg.asrModelId || defaultModelId(cfg.asrType || "sensevoice-small", $("#setup-asr-source").value);
+      $("#setup-asr-dir").value = cfg.asrModelDir || "";
+      $("#setup-vad-dir").value = cfg.vadModelDir || "";
+      $("#setup-qwen3-base").value = cfg.qwen3BaseUrl || "";
+      $("#setup-qwen3-key").value = cfg.qwen3ApiKey || "";
+      $("#setup-qwen3-model").value = cfg.qwen3Model || "";
+      setSetupAsrType($("#setup-asr-type").value);
       const cur = (state.config && state.config.engine) || "api";
       setSetupEngine(["api", "ollama", "llamacpp"].includes(cur) ? cur : "api");
     }
   } catch {
     // ignore
   }
+}
+
+function setSetupAsrType(type) {
+  const isApi = type === "qwen3-api";
+  $("#setup-asr-local").classList.toggle("hidden", isApi);
+  $("#setup-asr-api").classList.toggle("hidden", !isApi);
+  $("#setup-asr-dir-row").classList.toggle("hidden", isApi);
+  $("#setup-vad-row").classList.toggle("hidden", isApi);
 }
 
 function setSetupEngine(engine) {
@@ -1030,7 +1292,7 @@ function setSetupEngine(engine) {
   $("#setup-llamacpp-row").style.display = engine === "llamacpp" ? "flex" : "none";
 }
 
-function setupEngineValue() {
+function setupValues() {
   const engine = document.querySelector('input[name="setup-engine"]:checked')?.value || "api";
   return {
     videonekoModelDir: $("#setup-videoneko").value.trim(),
@@ -1042,31 +1304,38 @@ function setupEngineValue() {
     ollamaModel: $("#setup-ollama-model").value.trim(),
     llamacppBaseUrl: $("#setup-llamacpp-base").value.trim(),
     llamacppModel: $("#setup-llamacpp-model").value.trim(),
+    asrType: $("#setup-asr-type").value,
+    asrSource: $("#setup-asr-source").value,
+    asrModelId: $("#setup-asr-id").value.trim(),
+    asrModelDir: $("#setup-asr-dir").value.trim(),
+    vadModelDir: $("#setup-vad-dir").value.trim(),
+    qwen3BaseUrl: $("#setup-qwen3-base").value.trim(),
+    qwen3ApiKey: $("#setup-qwen3-key").value.trim(),
+    qwen3Model: $("#setup-qwen3-model").value.trim(),
   };
 }
 
 async function finishSetup() {
-  const v = setupEngineValue();
-  const cfg = {
-    ...(state.config || {}),
-    videonekoModelDir: v.videonekoModelDir,
-    engine: v.engine,
-    apiBaseUrl: v.apiBaseUrl,
-    apiKey: v.apiKey,
-    apiModel: v.apiModel,
-    ollamaBaseUrl: v.ollamaBaseUrl,
-    ollamaModel: v.ollamaModel,
-    llamacppBaseUrl: v.llamacppBaseUrl,
-    llamacppModel: v.llamacppModel,
-  };
+  const v = setupValues();
+  const cfg = { ...(state.config || {}), ...v };
+  const statusEl = $("#setup-funasr-status");
+  $("#setup-finish").disabled = true;
+  statusEl.textContent = t("settings.validating");
   try {
+    const report = await invoke("validate_model_config", { config: cfg });
+    if (!report.ok) {
+      statusEl.textContent = `${t("setup.funasrIncomplete")} ${(report.errors || []).join("; ")}`;
+      return;
+    }
     await invoke("save_config", { config: cfg });
-    state.config = cfg;
+    state.config = await invoke("get_config");
     $("#setup-modal").classList.add("hidden");
     loadSettings();
     setStatus(t("status.setupComplete"));
   } catch (e) {
-    setStatus(`${t("status.setupFailed")} ${e}`);
+    statusEl.textContent = `${t("status.setupFailed")} ${e}`;
+  } finally {
+    $("#setup-finish").disabled = false;
   }
 }
 
@@ -1083,6 +1352,7 @@ function applyLanguage() {
   renderQueue();
   renderEnv();
   renderSpkFileStatus();
+  renderModelReport(state.modelReport);
   renderResultsList();
   if (state.activeResult) openResult(state.activeResult.stem);
 }
@@ -1099,6 +1369,62 @@ function init() {
   $("#btn-clear").addEventListener("click", async () => { await invoke("clear_queue"); refreshQueue(); });
   $("#btn-recheck").addEventListener("click", () => refreshEnv(true));
   $("#btn-browse-videoneko").addEventListener("click", browseVideoneko);
+  // FunASR model configuration
+  $("#cfg-asr-type").addEventListener("change", () => {
+    const type = $("#cfg-asr-type").value;
+    setAsrType(type);
+    $("#cfg-asr-id").value = defaultModelId(type, $("#cfg-asr-source").value);
+  });
+  $("#cfg-asr-source").addEventListener("change", () => {
+    $("#cfg-asr-id").value = defaultModelId($("#cfg-asr-type").value, $("#cfg-asr-source").value);
+    setHubRows();
+  });
+  $("#cfg-vad-source").addEventListener("change", () => {
+    $("#cfg-vad-id").value = defaultModelId("fsmn-vad", $("#cfg-vad-source").value);
+    setHubRows();
+  });
+  $("#cfg-spk-source").addEventListener("change", () => {
+    $("#cfg-spk-id").value = defaultModelId("cam++", $("#cfg-spk-source").value);
+    setHubRows();
+  });
+  $("#cfg-spk-model-enabled").addEventListener("change", setSpkModelSettings);
+  $("#btn-download-asr").addEventListener("click", () => downloadModel("asr", "#cfg-asr-source", "#cfg-asr-id", "#cfg-asr-dir", "#asr-status"));
+  $("#btn-download-vad").addEventListener("click", () => downloadModel("vad", "#cfg-vad-source", "#cfg-vad-id", "#cfg-vad-dir", "#vad-status"));
+  $("#btn-download-spk").addEventListener("click", () => downloadModel("spk", "#cfg-spk-source", "#cfg-spk-id", "#cfg-spk-dir", "#spk-status"));
+  $("#btn-browse-asr").addEventListener("click", () => browseDir("#cfg-asr-dir"));
+  $("#btn-browse-vad").addEventListener("click", () => browseDir("#cfg-vad-dir"));
+  $("#btn-browse-spk").addEventListener("click", () => browseDir("#cfg-spk-dir"));
+  $("#btn-validate-asr").addEventListener("click", validateModels);
+  $("#btn-validate-vad").addEventListener("click", validateModels);
+  $("#btn-validate-spk").addEventListener("click", validateModels);
+  $("#btn-test-asr-api").addEventListener("click", testAsrApi);
+  $("#setup-asr-type").addEventListener("change", () => {
+    setSetupAsrType($("#setup-asr-type").value);
+    $("#setup-asr-id").value = defaultModelId($("#setup-asr-type").value, $("#setup-asr-source").value);
+  });
+  $("#setup-asr-source").addEventListener("change", () => {
+    $("#setup-asr-id").value = defaultModelId($("#setup-asr-type").value, $("#setup-asr-source").value);
+  });
+  $("#setup-download-asr").addEventListener("click", () =>
+    downloadModel("asr", "#setup-asr-source", "#setup-asr-id", "#setup-asr-dir", "#setup-funasr-status"));
+  $("#setup-download-vad").addEventListener("click", async () => {
+    const source = $("#setup-asr-source").value;
+    const statusEl = $("#setup-funasr-status");
+    if (source === "local") {
+      statusEl.textContent = t("settings.downloadNeedsHub");
+      return;
+    }
+    statusEl.textContent = t("settings.downloading");
+    try {
+      const r = await invoke("download_model", { kind: "vad", source, modelId: defaultModelId("fsmn-vad", source) });
+      $("#setup-vad-dir").value = r.path || "";
+      statusEl.textContent = t("settings.downloadDone");
+    } catch (e) {
+      statusEl.textContent = `${t("settings.downloadFailed")} ${e}`;
+    }
+  });
+  $("#setup-browse-asr").addEventListener("click", () => browseDir("#setup-asr-dir"));
+  $("#setup-browse-vad").addEventListener("click", () => browseDir("#setup-vad-dir"));
   $("#cfg-spk-enabled").addEventListener("change", () => {
     $("#spk-settings").classList.toggle("hidden", !$("#cfg-spk-enabled").checked);
   });

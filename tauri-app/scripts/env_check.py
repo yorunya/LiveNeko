@@ -1,6 +1,14 @@
 """Environment checker for the LiveNeko Tauri app.
 
-Prints a JSON report of the Python environment: whether CUDA is available and whether the required Python libraries are importable. The interpreter version and ffmpeg presence are probed by the Rust backend directly, so they are not repeated here. The libraries needed for the local pipeline (audio_server.py visual_server.py) are reported together; DeepFilterNet (df) powers the CUDA audio denoiser. The LLM summarization now runs in-process via openai-rust2, so llama_cpp/openai are not required here.
+Prints a JSON report of the Python environment: whether CUDA is available and
+whether the required Python libraries are importable. The interpreter version
+and ffmpeg presence are probed by the Rust backend directly, so they are not
+repeated here. The libraries needed for the local pipeline
+(audio_server.py/visual_server.py) are reported together; DeepFilterNet (df)
+powers the CUDA audio denoiser. The LLM summarization runs in-process via
+openai-rust2, so llama_cpp/openai are not required here. `huggingface_hub` and
+`modelscope` are only needed to download FunASR models and are reported
+separately.
 """
 import importlib
 import json
@@ -15,6 +23,12 @@ REQUIRED_LIBS = [
     "funasr",
 ]
 
+# Optional: needed by the model downloader (Settings / first launch).
+DOWNLOAD_LIBS = [
+    "huggingface_hub",
+    "modelscope",
+]
+
 
 def lib_version(name):
     try:
@@ -26,6 +40,7 @@ def lib_version(name):
 
 def main():
     libs = {name: lib_version(name) for name in REQUIRED_LIBS}
+    download_libs = {name: lib_version(name) for name in DOWNLOAD_LIBS}
     cuda = False
     try:
         import torch
@@ -33,7 +48,8 @@ def main():
         cuda = bool(torch.cuda.is_available())
     except Exception:
         pass
-    print(json.dumps({"cuda": cuda, "libraries": libs}, ensure_ascii=False))
+    print(json.dumps({"cuda": cuda, "libraries": libs, "downloadLibraries": download_libs},
+                     ensure_ascii=False))
 
 
 if __name__ == "__main__":

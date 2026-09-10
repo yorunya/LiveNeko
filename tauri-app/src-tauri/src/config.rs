@@ -23,6 +23,37 @@ pub struct AppConfig {
     pub speaker_ref: String,
     /// UI language: "" (system default) | "en" | "zh".
     pub language: String,
+
+    // ---- FunASR audio models (user-provided; never bundled) ----
+    /// Base directory used for models downloaded from Hugging Face / ModelScope.
+    pub funasr_models_dir: String,
+    /// ASR backend: "sensevoice-small" | "fun-asr-nano" | "paraformer-zh-streaming" | "qwen3-api"
+    pub asr_type: String,
+    /// ASR model source for local backends: "local" | "huggingface" | "modelscope"
+    pub asr_source: String,
+    /// ASR repository id on the selected hub (used for downloads / display).
+    pub asr_model_id: String,
+    /// Local ASR model directory (either user-picked or a completed download).
+    pub asr_model_dir: String,
+    /// Optional ASR language hint ("" = model default; en/zh/auto/...).
+    pub asr_language: String,
+    /// VAD model source: "local" | "huggingface" | "modelscope" (fsmn-vad compatible).
+    pub vad_source: String,
+    pub vad_model_id: String,
+    pub vad_model_dir: String,
+    /// SPK model is optional: when disabled (or missing) speaker identification
+    /// is disabled and every utterance is labelled "other".
+    pub spk_enabled: bool,
+    /// SPK model source: "local" | "huggingface" | "modelscope" (cam++ compatible).
+    pub spk_source: String,
+    pub spk_model_id: String,
+    pub spk_model_dir: String,
+    // Qwen3-ASR online API (used when asrType == "qwen3-api")
+    pub qwen3_base_url: String,
+    pub qwen3_api_key: String,
+    pub qwen3_model: String,
+    pub qwen3_language: String,
+
     // OpenAI-compatible API
     pub api_base_url: String,
     pub api_key: String,
@@ -44,6 +75,48 @@ pub struct AppConfig {
     pub llamacpp_thinking: bool,
 }
 
+pub const ASR_TYPES: [&str; 4] = [
+    "sensevoice-small",
+    "fun-asr-nano",
+    "paraformer-zh-streaming",
+    "qwen3-api",
+];
+
+/// Default hub repository id for a model type + source. `source` is
+/// "huggingface" or "modelscope"; anything else falls back to Hugging Face ids.
+pub fn default_model_id(kind: &str, source: &str) -> String {
+    let hf = source != "modelscope";
+    let id = match kind {
+        "sensevoice-small" => {
+            if hf { "FunAudioLLM/SenseVoiceSmall" } else { "iic/SenseVoiceSmall" }
+        }
+        "fun-asr-nano" => "FunAudioLLM/Fun-ASR-Nano-2512",
+        "paraformer-zh-streaming" => {
+            if hf {
+                "funasr/paraformer-zh-streaming"
+            } else {
+                "iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online"
+            }
+        }
+        "fsmn-vad" => {
+            if hf {
+                "funasr/fsmn-vad"
+            } else {
+                "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"
+            }
+        }
+        "cam++" => {
+            if hf { "funasr/campplus" } else { "iic/speech_campplus_sv_zh-cn_16k-common" }
+        }
+        _ => "",
+    };
+    id.to_string()
+}
+
+fn valid_source(value: &str) -> bool {
+    matches!(value, "local" | "huggingface" | "modelscope")
+}
+
 impl AppConfig {
     pub fn new() -> Self {
         Self {
@@ -56,6 +129,23 @@ impl AppConfig {
             speaker_name: String::new(),
             speaker_ref: String::new(),
             language: String::new(),
+            funasr_models_dir: String::new(),
+            asr_type: "sensevoice-small".to_string(),
+            asr_source: "huggingface".to_string(),
+            asr_model_id: default_model_id("sensevoice-small", "huggingface"),
+            asr_model_dir: String::new(),
+            asr_language: String::new(),
+            vad_source: "huggingface".to_string(),
+            vad_model_id: default_model_id("fsmn-vad", "huggingface"),
+            vad_model_dir: String::new(),
+            spk_enabled: false,
+            spk_source: "huggingface".to_string(),
+            spk_model_id: default_model_id("cam++", "huggingface"),
+            spk_model_dir: String::new(),
+            qwen3_base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1".to_string(),
+            qwen3_api_key: String::new(),
+            qwen3_model: "qwen3-asr-flash".to_string(),
+            qwen3_language: String::new(),
             api_base_url: "https://api.openai.com/v1".to_string(),
             api_key: String::new(),
             api_model: "gpt-4o".to_string(),
@@ -74,6 +164,22 @@ impl AppConfig {
 
     pub fn config_file_path(app_data_dir: &std::path::Path) -> PathBuf {
         app_data_dir.join("config.json")
+    }
+
+    /// True when the online Qwen3-ASR backend is selected.
+    pub fn asr_is_api(&self) -> bool {
+        self.asr_type == "qwen3-api"
+    }
+
+    /// True when the required FunASR fields are configured (no filesystem or
+    /// network validation — see `validate_model_config` for that).
+    pub fn funasr_configured(&self) -> bool {
+        let asr_ok = if self.asr_is_api() {
+            !self.qwen3_base_url.trim().is_empty() && !self.qwen3_model.trim().is_empty()
+        } else {
+            !self.asr_model_dir.trim().is_empty()
+        };
+        asr_ok && !self.vad_model_dir.trim().is_empty()
     }
 
     /// Normalize/migrate field values so they always hold valid defaults
@@ -111,6 +217,45 @@ impl AppConfig {
         }
         if self.llamacpp_base_url.is_empty() {
             self.llamacpp_base_url = "http://localhost:8080/v1".to_string();
+        }
+
+        // FunASR audio models
+        if !ASR_TYPES.contains(&self.asr_type.as_str()) {
+            self.asr_type = "sensevoice-small".to_string();
+        }
+        if !valid_source(&self.asr_source) {
+            self.asr_source = "huggingface".to_string();
+        }
+        if !valid_source(&self.vad_source) {
+            self.vad_source = "huggingface".to_string();
+        }
+        if !valid_source(&self.spk_source) {
+            self.spk_source = "huggingface".to_string();
+        }
+        if self.asr_model_id.trim().is_empty() {
+            self.asr_model_id = default_model_id(&self.asr_type, &self.asr_source);
+        }
+        if self.vad_model_id.trim().is_empty() {
+            self.vad_model_id = default_model_id("fsmn-vad", &self.vad_source);
+        }
+        if self.spk_model_id.trim().is_empty() {
+            self.spk_model_id = default_model_id("cam++", &self.spk_source);
+        }
+        self.asr_model_dir = self.asr_model_dir.trim().to_string();
+        self.vad_model_dir = self.vad_model_dir.trim().to_string();
+        self.spk_model_dir = self.spk_model_dir.trim().to_string();
+        self.asr_language = self.asr_language.trim().to_string();
+        self.funasr_models_dir = self.funasr_models_dir.trim().to_string();
+        if self.qwen3_base_url.trim().is_empty() {
+            self.qwen3_base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1".to_string();
+        }
+        if self.qwen3_model.trim().is_empty() {
+            self.qwen3_model = "qwen3-asr-flash".to_string();
+        }
+        // Without a SPK model directory there is nothing to load; keep the
+        // switch off so the pipeline never tries.
+        if self.spk_model_dir.is_empty() {
+            self.spk_enabled = false;
         }
     }
 

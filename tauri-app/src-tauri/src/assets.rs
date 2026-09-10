@@ -1,12 +1,11 @@
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager};
 
-/// Resolved locations of all bundled assets. During development these fall back to the repo root; in production they resolve from the resource directory.
+/// Resolved locations of all bundled assets. During development these fall back to the repo root; in production they resolve from the resource directory. FunASR models (ASR/VAD/SPK) are NOT bundled — the user provides them (see `AppConfig`).
 #[derive(Clone, Debug)]
 pub struct Assets {
     pub prompt_md: PathBuf,
     pub scripts_dir: PathBuf,
-    pub audio_model_dir: PathBuf,
     pub filter_model_tar: PathBuf,
 }
 
@@ -58,15 +57,13 @@ impl Assets {
         Self {
             prompt_md: pick("prompt.md"),
             scripts_dir: pick("scripts"),
-            audio_model_dir: pick("model"),
             filter_model_tar,
         }
     }
 
-    pub fn audio_models_present(&self) -> bool {
-        self.audio_model_dir.join("SenseVoiceSmall").exists()
-            && self.audio_model_dir.join("fsmn-vad").exists()
-            && self.audio_model_dir.join("cam++").exists()
+    /// Path to the Python model helper used for validation and downloads.
+    pub fn model_tools_script(&self) -> PathBuf {
+        self.scripts_dir.join("model_tools.py")
     }
 
     pub fn filter_model_present(&self) -> bool {

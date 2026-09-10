@@ -136,6 +136,44 @@ pub struct Runner {
     browser_cookies: Arc<Mutex<Option<Arc<Vec<crate::cookies::Cookie>>>>>,
 }
 
+/// Serialize the audio worker configuration (ASR backend, VAD/SPK model
+/// directories and the optional speaker reference) for `audio_server.py`.
+fn build_audio_config(config: &AppConfig, refs: Option<(&Path, &str)>) -> serde_json::Value {
+    let asr = if config.asr_is_api() {
+        serde_json::json!({
+            "backend": "qwen3-api",
+            "baseUrl": config.qwen3_base_url.trim(),
+            "apiKey": config.qwen3_api_key.trim(),
+            "model": config.qwen3_model.trim(),
+            "language": config.qwen3_language.trim(),
+        })
+    } else {
+        serde_json::json!({
+            "backend": "local",
+            "type": config.asr_type,
+            "dir": config.asr_model_dir.trim(),
+            "language": config.asr_language.trim(),
+        })
+    };
+    let spk = if config.spk_enabled && !config.spk_model_dir.trim().is_empty() {
+        serde_json::json!({ "dir": config.spk_model_dir.trim() })
+    } else {
+        serde_json::Value::Null
+    };
+    let refs_json = match refs {
+        Some((dir, name)) => {
+            serde_json::json!({ "dir": dir.display().to_string(), "name": name })
+        }
+        None => serde_json::Value::Null,
+    };
+    serde_json::json!({
+        "asr": asr,
+        "vad": { "dir": config.vad_model_dir.trim() },
+        "spk": spk,
+        "ref": refs_json,
+    })
+}
+
 impl Runner {
     pub fn new(app: AppHandle, assets: Assets, handle: PipelineHandle, cookie_browser: String) -> Self {
         Self {
@@ -164,17 +202,35 @@ impl Runner {
         let pids = self.handle.model_pids.clone();
         let python = crate::commands::PYTHON_CMD.to_string();
 
-        // The speaker reference is optional: when none is configured the SPK model still loads, but utterances are not tagged with a specific speaker.
-        let mut audio_args = vec![
-            "--model-dir".to_string(),
-            self.assets.audio_model_dir.display().to_string(),
-        ];
-        match self.speaker_reference(config)? {
-            Some((ref_dir, speaker_name)) => {
-                audio_args.push("--ref-dir".to_string());
-                audio_args.push(ref_dir.display().to_string());
-                audio_args.push("--speaker-name".to_string());
-                audio_args.push(speaker_name.clone());
+        // Build the audio worker configuration (ASR backend + VAD/SPK paths)
+        // and hand it to the resident worker as a JSON file. The user provides
+        // all FunASR models; nothing is bundled.
+        // Resolve the speaker reference only when a SPK model is actually in
+        // use; without one, speaker identification stays disabled even if a
+        // speaker name/reference was saved earlier.
+        let spk_active = config.spk_enabled && !config.spk_model_dir.trim().is_empty();
+        let refs = if spk_active {
+            self.speaker_reference(config)?
+        } else {
+            None
+        };
+        let audio_config = build_audio_config(config, refs.as_ref().map(|(d, n)| (d.as_path(), n.as_str())));
+        let config_dir = self
+            .app
+            .path()
+            .app_data_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join("work");
+        let _ = std::fs::create_dir_all(&config_dir);
+        let config_path = config_dir.join("audio_server.json");
+        std::fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&audio_config).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| format!("write audio model config: {e}"))?;
+
+        match &refs {
+            Some((_, speaker_name)) => {
                 self.emit_log(
                     "pipeline",
                     format!("[model] speaker identification: {speaker_name}"),
@@ -188,6 +244,27 @@ impl Runner {
                 );
             }
         }
+        if config.asr_is_api() {
+            self.emit_log(
+                "pipeline",
+                format!("[model] ASR backend: Qwen3-ASR API ({})", config.qwen3_model),
+            );
+        } else {
+            self.emit_log(
+                "pipeline",
+                format!(
+                    "[model] ASR model: {} ({})",
+                    config.asr_type, config.asr_model_dir
+                ),
+            );
+        }
+        if !config.spk_enabled || config.spk_model_dir.trim().is_empty() {
+            self.emit_log(
+                "pipeline",
+                "[model] no SPK model configured: speaker identification is disabled".to_string(),
+            );
+        }
+        let audio_args = vec!["--config".to_string(), config_path.display().to_string()];
 
         let audio_script = self.assets.scripts_dir.join("audio_server.py");
         self.emit_log(

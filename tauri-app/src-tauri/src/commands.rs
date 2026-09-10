@@ -1,8 +1,9 @@
 use crate::assets::Assets;
 use crate::config::AppConfig;
 use crate::model_ipc::log_line;
-use crate::pipeline::{self, ItemStatus, PipelineHandle, QueueItem, Runner};
+use crate::pipeline::{self, hide_console, ItemStatus, PipelineHandle, QueueItem, Runner};
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -23,8 +24,15 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(app_data_dir: PathBuf, os_theme: String, os_accent: Option<String>) -> Self {
+        let mut config = AppConfig::load(&app_data_dir);
+        if config.funasr_models_dir.trim().is_empty() {
+            config.funasr_models_dir = app_data_dir
+                .join("funasr-models")
+                .to_string_lossy()
+                .to_string();
+        }
         Self {
-            config: Mutex::new(AppConfig::load(&app_data_dir)),
+            config: Mutex::new(config),
             queue: Mutex::new(Vec::new()),
             pipeline: PipelineHandle::default(),
             running: AtomicBool::new(false),
@@ -40,22 +48,118 @@ fn emit_app(app: &AppHandle, event: &str, payload: serde_json::Value) {
     let _ = app.emit(event, payload);
 }
 
-fn ensure_assets(app: &AppHandle) -> Result<Assets, String> {
+fn ensure_assets(app: &AppHandle, cfg: &AppConfig) -> Result<Assets, String> {
     let assets = Assets::resolve(app);
-    // via crate::downloader using the same unauthenticated Bilibili/YouTube APIs.
-    if !assets.audio_models_present() {
-        return Err(format!(
-            "bundled audio models missing under {}",
-            assets.audio_model_dir.display()
-        ));
-    }
     if !assets.filter_model_present() {
         return Err(format!(
             "DeepFilterNet model missing at {}",
             assets.filter_model_tar.display()
         ));
     }
+    if !assets.model_tools_script().exists() {
+        return Err(format!(
+            "model helper script missing at {}",
+            assets.model_tools_script().display()
+        ));
+    }
+    let report = validate_model_config_impl(&assets, cfg)?;
+    if report.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+        let errors = report
+            .get("errors")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            })
+            .unwrap_or_default();
+        return Err(if errors.is_empty() {
+            "FunASR model configuration is incomplete — open Settings and configure the ASR/VAD models"
+                .to_string()
+        } else {
+            format!("FunASR model configuration invalid: {errors}")
+        });
+    }
     Ok(assets)
+}
+
+/// Run the Python model checker (`scripts/model_tools.py check`) for the
+/// current config and return its parsed JSON report. This only stats files and
+/// reads configs — it never imports torch/funasr, so it is fast and safe to
+/// call before every run.
+pub(crate) fn validate_model_config_impl(
+    assets: &Assets,
+    cfg: &AppConfig,
+) -> Result<serde_json::Value, String> {
+    let script = assets.model_tools_script();
+    if !script.exists() {
+        return Err(format!("model helper script missing at {}", script.display()));
+    }
+    let mut checks = serde_json::Map::new();
+    if cfg.asr_is_api() {
+        checks.insert(
+            "asr".to_string(),
+            serde_json::json!({
+                "kind": "api", "enabled": true,
+                "baseUrl": cfg.qwen3_base_url.trim(),
+                "apiKey": cfg.qwen3_api_key.trim(),
+                "model": cfg.qwen3_model.trim(),
+            }),
+        );
+    } else {
+        checks.insert(
+            "asr".to_string(),
+            serde_json::json!({
+                "kind": "asr", "enabled": true,
+                "type": cfg.asr_type, "dir": cfg.asr_model_dir.trim(),
+            }),
+        );
+    }
+    checks.insert(
+        "vad".to_string(),
+        serde_json::json!({
+            "kind": "vad", "enabled": true,
+            "type": "fsmn-vad", "dir": cfg.vad_model_dir.trim(),
+        }),
+    );
+    if cfg.spk_enabled && !cfg.spk_model_dir.trim().is_empty() {
+        checks.insert(
+            "spk".to_string(),
+            serde_json::json!({
+                "kind": "spk", "enabled": true,
+                "type": "cam++", "dir": cfg.spk_model_dir.trim(),
+            }),
+        );
+    } else {
+        checks.insert(
+            "spk".to_string(),
+            serde_json::json!({ "kind": "spk", "enabled": false }),
+        );
+    }
+
+    let check_path = std::env::temp_dir().join(format!(
+        "liveneko_model_check_{}.json",
+        std::process::id()
+    ));
+    std::fs::write(
+        &check_path,
+        serde_json::to_string(&checks).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| format!("write model check: {e}"))?;
+    let out = run_capture(
+        PYTHON_CMD,
+        &[
+            "-u",
+            script.to_str().unwrap_or(""),
+            "check",
+            "--config",
+            check_path.to_str().unwrap_or(""),
+        ],
+    );
+    let _ = std::fs::remove_file(&check_path);
+    let out = out?;
+    serde_json::from_str(&out).map_err(|e| format!("invalid model check output: {e}"))
 }
 
 // Commands
@@ -97,6 +201,7 @@ fn run_environment_check(app: &AppHandle) -> serde_json::Value {
 
     // Python libraries check
     let mut libs = serde_json::json!({});
+    let mut download_libs = serde_json::json!({});
     let mut cuda = false;
     let mut python_libs_ok = false;
     if python_ok {
@@ -112,6 +217,10 @@ fn run_environment_check(app: &AppHandle) -> serde_json::Value {
                         .unwrap_or(false);
                     // env_check.py emits {"cuda": .., "libraries": {..}}; the frontend expects the flat per-library object under "libraries", so unwrap it here.
                     libs = parsed.get("libraries").cloned().unwrap_or_default();
+                    download_libs = parsed
+                        .get("downloadLibraries")
+                        .cloned()
+                        .unwrap_or_default();
                     python_libs_ok = true;
                 }
             }
@@ -124,6 +233,7 @@ fn run_environment_check(app: &AppHandle) -> serde_json::Value {
         "cuda": cuda,
         "pythonLibraries": python_libs_ok,
         "libraries": libs,
+        "downloadLibraries": download_libs,
         "assets": {
             "promptMd": assets.prompt_md.exists(),
             "scripts": assets.scripts_dir.exists(),
@@ -376,13 +486,22 @@ pub fn get_setup_status(state: State<'_, AppState>) -> Result<serde_json::Value,
     let cfg = state.config.lock().unwrap().clone();
     let model_ok =
         !cfg.videoneko_model_dir.is_empty() && std::fs::metadata(&cfg.videoneko_model_dir).is_ok();
+    let needs_funasr = !cfg.funasr_configured();
+    let needs_spk = cfg.spk_enabled && cfg.spk_model_dir.trim().is_empty();
     Ok(serde_json::json!({
         "firstLaunch": cfg.videoneko_model_dir.is_empty()
             && cfg.ollama_model.is_empty()
             && cfg.llamacpp_model.is_empty()
             && cfg.api_model.is_empty(),
         "needsVideoneko": !model_ok,
+        "needsFunasr": needs_funasr,
+        "needsSpk": needs_spk,
         "videonekoModelDir": cfg.videoneko_model_dir,
+        "funasrModelsDir": cfg.funasr_models_dir,
+        "asrType": cfg.asr_type,
+        "asrModelDir": cfg.asr_model_dir,
+        "vadModelDir": cfg.vad_model_dir,
+        "spkModelDir": cfg.spk_model_dir,
     }))
 }
 
@@ -454,8 +573,8 @@ pub fn start_pipeline(app: AppHandle, state: State<'_, AppState>) -> Result<(), 
     if state.running.swap(true, Ordering::SeqCst) {
         return Err("pipeline already running".to_string());
     }
-    let assets = ensure_assets(&app)?;
     let cfg = state.config.lock().unwrap().clone();
+    let assets = ensure_assets(&app, &cfg)?;
     let items: Vec<QueueItem> = state
         .queue
         .lock()
@@ -963,6 +1082,204 @@ pub async fn test_api_connection(
     } else {
         Err(format!("HTTP {status}: {text}"))
     }
+}
+
+/// Validate the FunASR model configuration (paths, file contents and model
+/// type compatibility) without loading any model. Returns the same report the
+/// pipeline uses to gate a run.
+#[tauri::command]
+pub async fn validate_model_config(
+    app: AppHandle,
+    mut config: AppConfig,
+) -> Result<serde_json::Value, String> {
+    config.normalize();
+    tauri::async_runtime::spawn_blocking(move || {
+        let assets = Assets::resolve(&app);
+        validate_model_config_impl(&assets, &config)
+    })
+    .await
+    .map_err(|e| format!("validate task failed: {e}"))?
+}
+
+/// Download a model snapshot from Hugging Face / ModelScope into the model
+/// directory. Progress is emitted as `model://progress` events with
+/// `{ "kind": "asr"|"vad"|"spk", "progress": 0..100 }`.
+#[tauri::command]
+pub async fn download_model(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    kind: String,
+    source: String,
+    model_id: String,
+    dest: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let kind = kind.trim().to_lowercase();
+    if !matches!(kind.as_str(), "asr" | "vad" | "spk") {
+        return Err("model kind must be 'asr', 'vad' or 'spk'".to_string());
+    }
+    let source = source.trim().to_lowercase();
+    if !matches!(source.as_str(), "huggingface" | "hf" | "modelscope" | "ms") {
+        return Err("model source must be 'huggingface' or 'modelscope'".to_string());
+    }
+    let model_id = model_id.trim().to_string();
+    if model_id.is_empty() {
+        return Err("model id is required".to_string());
+    }
+    let dest = dest
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty())
+        .unwrap_or_else(|| {
+            let base = state.config.lock().unwrap().funasr_models_dir.clone();
+            let base = if base.trim().is_empty() {
+                state
+                    .app_data_dir
+                    .join("funasr-models")
+                    .to_string_lossy()
+                    .to_string()
+            } else {
+                base
+            };
+            std::path::Path::new(&base)
+                .join(&kind)
+                .to_string_lossy()
+                .to_string()
+        });
+    let assets = Assets::resolve(&app);
+    let script = assets.model_tools_script();
+    if !script.exists() {
+        return Err(format!("model helper script missing at {}", script.display()));
+    }
+    let app2 = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        run_download_blocking(&app2, &script, &kind, &source, &model_id, &dest)
+    })
+    .await
+    .map_err(|e| format!("download task failed: {e}"))?
+}
+
+/// Run the Python downloader, forwarding progress events while collecting the
+/// final JSON result.
+fn run_download_blocking(
+    app: &AppHandle,
+    script: &std::path::Path,
+    kind: &str,
+    source: &str,
+    model_id: &str,
+    dest: &str,
+) -> Result<serde_json::Value, String> {
+    use std::io::{BufRead, BufReader};
+
+    let mut cmd = Command::new(PYTHON_CMD);
+    cmd.arg("-u").arg(script).args([
+        "download",
+        "--source",
+        source,
+        "--model-id",
+        model_id,
+        "--dest",
+        dest,
+    ]);
+    hide_console(&mut cmd);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| format!("spawn downloader: {e}"))?;
+    let stdout = child.stdout.take().ok_or("no stdout on downloader")?;
+    let stderr = child.stderr.take().ok_or("no stderr on downloader")?;
+    let err_thread = std::thread::spawn(move || {
+        let mut text = String::new();
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            text.push_str(&line);
+            text.push('\n');
+        }
+        text
+    });
+    let mut result: Option<serde_json::Value> = None;
+    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+            if let Some(progress) = value.get("progress").and_then(|v| v.as_u64()) {
+                let _ = app.emit(
+                    "model://progress",
+                    serde_json::json!({ "kind": kind, "progress": progress }),
+                );
+            } else if value.get("ok").is_some() {
+                result = Some(value);
+            }
+        }
+    }
+    let status = child.wait().map_err(|e| format!("downloader wait: {e}"))?;
+    let stderr_text = err_thread.join().unwrap_or_default();
+    let result = result.ok_or_else(|| {
+        format!(
+            "downloader produced no result (exit {status:?}): {}",
+            stderr_text.trim()
+        )
+    })?;
+    if result.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+        let message = result
+            .get("errors")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            })
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| stderr_text.trim().to_string());
+        return Err(message);
+    }
+    Ok(result)
+}
+
+/// Probe the configured Qwen3-ASR (OpenAI-compatible) endpoint.
+#[tauri::command]
+pub async fn test_asr_connection(
+    app: AppHandle,
+    base_url: String,
+    api_key: String,
+    model: String,
+    language: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let assets = Assets::resolve(&app);
+    let script = assets.model_tools_script();
+    if !script.exists() {
+        return Err(format!("model helper script missing at {}", script.display()));
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let out = run_capture(
+            PYTHON_CMD,
+            &[
+                "-u",
+                script.to_str().unwrap_or(""),
+                "check-api",
+                "--base-url",
+                &base_url,
+                "--api-key",
+                &api_key,
+                "--model",
+                &model,
+                "--language",
+                language.as_deref().unwrap_or(""),
+            ],
+        )?;
+        let value: serde_json::Value =
+            serde_json::from_str(&out).map_err(|e| format!("invalid API check output: {e}"))?;
+        if value.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+            let message = value
+                .get("errors")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                })
+                .unwrap_or_else(|| "connection failed".to_string());
+            return Err(message);
+        }
+        Ok(value)
+    })
+    .await
+    .map_err(|e| format!("API check task failed: {e}"))?
 }
 
 #[cfg(test)]

@@ -1,12 +1,34 @@
 """Resident IPC audio worker for the LiveNeko Tauri app.
 
 Launched once by the Rust backend at the start of a pipeline run. Loads the
-VAD, ASR and speaker models a single time, then stays alive reading JSON
+configured VAD/ASR/SPK models a single time, then stays alive reading JSON
 requests on stdin and writing JSON responses on stdout until told to shut down.
 Models are NOT reloaded between requests.
 
+FunASR models are user-provided (local directories or downloaded from Hugging
+Face / ModelScope by the app); none are bundled. The worker is configured with
+a JSON file written by the Rust backend:
+
+  {
+    "asr": {"backend": "local", "type": "sensevoice-small",
+            "dir": "<asr model dir>", "language": "zh"},
+    "vad": {"dir": "<fsmn-vad dir>"},
+    "spk": {"dir": "<cam++ dir>"} | null,
+    "ref": {"dir": "<reference wav dir>", "name": "taffy"} | null
+  }
+
+  For the online ASR backend the `asr` object is:
+    {"backend": "qwen3-api", "baseUrl": "...", "apiKey": "...",
+     "model": "qwen3-asr-flash", "language": "zh"}
+
+ASR types:
+  - sensevoice-small        SenseVoiceSmall (emotion/event tags preserved)
+  - fun-asr-nano            Fun-ASR-Nano-2512
+  - paraformer-zh-streaming Streaming Paraformer (used chunk-by-chunk)
+  - qwen3-api               Qwen3-ASR over an OpenAI-compatible endpoint
+
 The `process` command expects an already-denoised 16 kHz mono WAV. DeepFilterNet
-noise suppression now runs in-process in Rust (tauri-app/src-tauri/src/df_denoise.rs)
+noise suppression runs in-process in Rust (tauri-app/src-tauri/src/df_denoise.rs)
 using the ONNX `df` crate, so this worker only performs VAD/ASR/SPK.
 
 Protocol (newline-delimited JSON on stdin/stdout):
@@ -17,23 +39,32 @@ Protocol (newline-delimited JSON on stdin/stdout):
   Shutdown: {"cmd":"shutdown"}
 Progress is emitted on stdout as {"progress":N} lines: 0..100 for the ASR phase.
 
-The reference dir (--ref-dir) is optional. When it is missing or empty the SPK
-model still loads, but utterances are not compared against any voiceprint and
-every speaker label is "other".
+The SPK model and reference voiceprints are both optional. Without a SPK model,
+or without reference WAVs, no speaker is identified and every utterance is
+labelled "other".
 """
 import argparse
 import concurrent.futures
 import contextlib
 import glob
+import io
 import json
 import logging
 import os
 import sys
 
-import numpy as np
-import soundfile as sf
-import torch
-from funasr import AutoModel
+try:
+    import numpy as np
+    import soundfile as sf
+    import torch
+    from funasr import AutoModel
+    from qwen3_asr_client import AsrApiError, request_asr, wav_data_url
+    _IMPORT_ERROR = None
+except Exception as _exc:  # noqa: BLE001 - reported over IPC in main()
+    np = sf = torch = None
+    AutoModel = None
+    AsrApiError = request_asr = wav_data_url = None
+    _IMPORT_ERROR = _exc
 
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -46,8 +77,17 @@ SAMPLE_RATE = 16000
 ASR_BATCH = 64
 # Max seconds of audio packed into one ASR forward pass (VRAM < 8 GB).
 ASR_BATCH_SIZE_S = 300
+# Fun-ASR-Nano is an LLM decoder: keep the packed batch smaller.
+ASR_BATCH_SIZE_S_NANO = 120
+# Streaming Paraformer chunking (600 ms chunks, look-backs per the FunASR docs).
+PARAFORMER_CHUNK_SIZE = [0, 10, 5]
+PARAFORMER_STRIDE = PARAFORMER_CHUNK_SIZE[1] * 960
+PARAFORMER_ENC_LOOK_BACK = 4
+PARAFORMER_DEC_LOOK_BACK = 1
 SPK_MIN_SAMPLES = int(SPK_MIN_S * SAMPLE_RATE)
 SPK_CHUNK_SAMPLES = int(SPK_CHUNK_S * SAMPLE_RATE)
+
+LOCAL_ASR_TYPES = ("sensevoice-small", "fun-asr-nano", "paraformer-zh-streaming")
 
 
 def send(obj):
@@ -67,20 +107,182 @@ def quiet_stdout():
         sys.stdout = real_stdout
 
 
-# ---- VAD / ASR / speaker ----
+# ---- ASR backends ----
 
-def load_speech(wav_path, model):
-    speech, sr = sf.read(wav_path, dtype="float32")
-    if sr != SAMPLE_RATE:
-        raise RuntimeError(f"Unexpected sample rate {sr} for {wav_path}; expected {SAMPLE_RATE}")
-    segments = model.inference(
-        input=speech, model=model.vad_model, kwargs=model.vad_kwargs, fs=SAMPLE_RATE
+class LocalAsr:
+    """FunASR AutoModel ASR loaded from a local model directory."""
+
+    def __init__(self, model_type, model_dir, device, language=""):
+        if model_type not in LOCAL_ASR_TYPES:
+            raise RuntimeError(f"unsupported local ASR type: {model_type}")
+        if not model_dir or not os.path.isdir(model_dir):
+            raise RuntimeError(f"ASR model directory not found: {model_dir}")
+        self.name = model_type
+        self.language = (language or "").strip()
+        log.info(f"Loading ASR model '{model_type}' from {model_dir}")
+        self.model = AutoModel(
+            model=model_dir,
+            device=device,
+            disable_update=True,
+            disable_pbar=True,
+            trust_remote_code=True,
+        )
+
+    def _stream_paraformer(self, samples):
+        cache = {}
+        parts = []
+        for start in range(0, len(samples), PARAFORMER_STRIDE):
+            end = min(start + PARAFORMER_STRIDE, len(samples))
+            result = self.model.generate(
+                input=samples[start:end],
+                cache=cache,
+                is_final=end == len(samples),
+                chunk_size=PARAFORMER_CHUNK_SIZE,
+                encoder_chunk_look_back=PARAFORMER_ENC_LOOK_BACK,
+                decoder_chunk_look_back=PARAFORMER_DEC_LOOK_BACK,
+                batch_size=1,
+            )
+            if result and result[0].get("text"):
+                parts.append(result[0]["text"])
+        return "".join(parts)
+
+    def transcribe(self, chunks):
+        """Transcribe a list of float32 mono 16 kHz numpy chunks."""
+        if not chunks:
+            return []
+        if self.name == "paraformer-zh-streaming":
+            return [self._stream_paraformer(c) for c in chunks]
+
+        kwargs = {}
+        if self.name == "sensevoice-small":
+            # Preserve the historical behavior: Chinese + inverse text normalization.
+            kwargs["language"] = self.language or "zh"
+            kwargs["use_itn"] = True
+            kwargs["batch_size_s"] = ASR_BATCH_SIZE_S
+        else:  # fun-asr-nano
+            if self.language:
+                kwargs["language"] = self.language
+            kwargs["itn"] = True
+            kwargs["batch_size_s"] = ASR_BATCH_SIZE_S_NANO
+        results = self.model.generate(input=chunks, **kwargs)
+        return [r.get("text", "") for r in results]
+
+
+class Qwen3ApiAsr:
+    """Qwen3-ASR over an OpenAI-compatible or native DashScope endpoint.
+
+    The endpoint/shape selection lives in `qwen3_asr_client.py`; this class
+    only turns local samples into a WAV data URL and forwards the result.
+    """
+
+    def __init__(self, base_url, api_key, model, language="", timeout=180, retries=2):
+        self.name = "qwen3-api"
+        self.base_url = (base_url or "").strip()
+        self.api_key = (api_key or "").strip()
+        self.model = (model or "").strip()
+        self.language = (language or "").strip()
+        self.timeout = timeout
+        self.retries = retries
+        if not self.base_url:
+            raise RuntimeError("Qwen3-ASR API base URL is not configured")
+        if not self.model:
+            raise RuntimeError("Qwen3-ASR API model name is not configured")
+
+    def _request(self, samples):
+        buf = io.BytesIO()
+        sf.write(buf, samples, SAMPLE_RATE, format="WAV", subtype="PCM_16")
+        text, _method = request_asr(
+            self.base_url,
+            self.api_key,
+            self.model,
+            wav_data_url(buf.getvalue()),
+            language=self.language,
+            timeout=self.timeout,
+            retries=self.retries,
+        )
+        return text
+
+    def transcribe(self, chunks):
+        texts = []
+        failures = 0
+        first_error = None
+        for chunk in chunks:
+            try:
+                texts.append(self._request(chunk))
+            except AsrApiError as exc:
+                if exc.fatal:
+                    raise RuntimeError(str(exc)) from exc
+                # Models such as qwen-audio-3.0-asr-flash reject very short or
+                # silent clips with `HTTP 400 {}`. Skip those chunks, report
+                # them in the log, and only abort when *every* chunk failed.
+                failures += 1
+                first_error = first_error or exc
+                log.warning(
+                    "Qwen3-ASR rejected a %.2fs audio chunk: %s",
+                    len(chunk) / SAMPLE_RATE,
+                    exc,
+                )
+                texts.append("")
+        if chunks and failures == len(chunks) and first_error is not None:
+            raise RuntimeError(str(first_error))
+        return texts
+
+
+def build_asr(config, device):
+    asr_cfg = config.get("asr") or {}
+    backend = asr_cfg.get("backend", "local")
+    if backend == "qwen3-api":
+        return Qwen3ApiAsr(
+            asr_cfg.get("baseUrl", ""),
+            asr_cfg.get("apiKey", ""),
+            asr_cfg.get("model", ""),
+            asr_cfg.get("language", ""),
+        )
+    return LocalAsr(
+        asr_cfg.get("type", ""),
+        asr_cfg.get("dir", ""),
+        device,
+        asr_cfg.get("language", ""),
+    )
+
+
+# ---- VAD / SPK ----
+
+def load_vad(vad_dir, device):
+    if not vad_dir or not os.path.isdir(vad_dir):
+        raise RuntimeError(f"VAD model directory not found: {vad_dir}")
+    log.info(f"Loading VAD model from {vad_dir}")
+    return AutoModel(
+        model=vad_dir,
+        device=device,
+        disable_update=True,
+        disable_pbar=True,
+        trust_remote_code=False,
+    )
+
+
+def detect_segments(speech, vad):
+    """Run the FSMN-VAD model and return its [[start_ms, end_ms], ...] segments."""
+    return vad.inference(
+        input=speech, model=vad.model, kwargs=vad.kwargs, fs=SAMPLE_RATE
     )[0]["value"]
-    return speech, segments
 
 
-def speaker_embeddings(chunks, model):
-    results = model.inference(input=chunks, model=model.spk_model, kwargs=model.spk_kwargs)
+def load_spk(spk_dir, device):
+    if not spk_dir or not os.path.isdir(spk_dir):
+        raise RuntimeError(f"SPK model directory not found: {spk_dir}")
+    log.info(f"Loading SPK model from {spk_dir}")
+    return AutoModel(
+        model=spk_dir,
+        device=device,
+        disable_update=True,
+        disable_pbar=True,
+        trust_remote_code=True,
+    )
+
+
+def speaker_embeddings(chunks, spk):
+    results = spk.inference(input=chunks, model=spk.model, kwargs=spk.kwargs)
     embeddings = []
     for res in results:
         e = res["spk_embedding"]
@@ -91,8 +293,11 @@ def speaker_embeddings(chunks, model):
     return embeddings
 
 
-def build_reference(wav_path, model):
-    speech, segments = load_speech(wav_path, model)
+def build_reference(wav_path, vad, spk):
+    speech, sr = sf.read(wav_path, dtype="float32")
+    if sr != SAMPLE_RATE:
+        raise RuntimeError(f"Unexpected sample rate {sr} for {wav_path}; expected {SAMPLE_RATE}")
+    segments = detect_segments(speech, vad)
     chunks = []
     step = SPK_CHUNK_SAMPLES
     for start_ms, end_ms in segments:
@@ -103,16 +308,18 @@ def build_reference(wav_path, model):
                 chunks.append(chunk)
     if not chunks:
         raise RuntimeError(f"No speech found in reference {wav_path}")
-    ref = np.mean(speaker_embeddings(chunks, model), axis=0)
+    ref = np.mean(speaker_embeddings(chunks, spk), axis=0)
     ref /= np.linalg.norm(ref)
     return ref
 
 
-def _speaker_embeddings_matrix(chunks, long_idx, model):
-    return np.stack(speaker_embeddings([chunks[j] for j in long_idx], model))
+def _speaker_embeddings_matrix(chunks, long_idx, spk):
+    return np.stack(speaker_embeddings([chunks[j] for j in long_idx], spk))
 
 
-def transcribe_samples(speech, segments, model, ref_matrix, speaker_name, on_progress=None):
+# ---- transcription pipeline ----
+
+def transcribe_samples(speech, segments, asr, vad, spk, ref_matrix, speaker_name, on_progress=None):
     log.info(f"VAD: {len(segments)} utterances")
     utterances = []
     total = max(len(segments), 1)
@@ -131,23 +338,25 @@ def transcribe_samples(speech, segments, model, ref_matrix, speaker_name, on_pro
             sims = dict(zip(long_idx, np.max(ref_matrix @ spk_emb.T, axis=0)))
         for j, ((start_ms, end_ms), res) in enumerate(zip(batch, results)):
             speaker = speaker_name if sims.get(j, -1.0) > SPK_THRESHOLD else OTHER_LABEL
-            utterances.append([int(start_ms), int(end_ms), speaker, res["text"]])
+            # `res` is the worker result dict ({"text": ...}); the Rust IPC
+            # contract expects a plain string as the 4th utterance element.
+            text = res.get("text", "") if isinstance(res, dict) else str(res)
+            utterances.append([int(start_ms), int(end_ms), speaker, text])
 
     # Pipeline ASR (main thread) and SPK (worker thread): the SPK pass of batch i
-    # overlaps the ASR pass of batch i+1. Without a reference voiceprint the SPK pass is skipped entirely.
+    # overlaps the ASR pass of batch i+1. Without a SPK model or reference
+    # voiceprint the SPK pass is skipped entirely.
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as spk_executor:
         pending = None
         for idx, (batch, chunks, long_idx) in enumerate(batches):
-            results = model.inference(
-                input=chunks, model=model.model, kwargs=model.kwargs,
-                language="zh", use_itn=True, batch_size_s=ASR_BATCH_SIZE_S,
-            )
+            texts = asr.transcribe(chunks)
+            results = [{"text": text} for text in texts]
             if pending is not None:
                 p_batch, p_long_idx, p_results, p_future = pending
                 spk_emb = p_future.result() if p_future is not None else None
                 finalize(p_batch, p_long_idx, p_results, spk_emb)
-            if long_idx and ref_matrix is not None:
-                future = spk_executor.submit(_speaker_embeddings_matrix, chunks, long_idx, model)
+            if long_idx and ref_matrix is not None and spk is not None:
+                future = spk_executor.submit(_speaker_embeddings_matrix, chunks, long_idx, spk)
             else:
                 future = None
             pending = (batch, long_idx, results, future)
@@ -162,7 +371,7 @@ def transcribe_samples(speech, segments, model, ref_matrix, speaker_name, on_pro
     return utterances
 
 
-def process(req, model, ref_matrix, speaker_name):
+def process(req, asr, vad, spk, ref_matrix, speaker_name):
     rid = req.get("id", "")
     input_wav = req.get("input", "")
     if not input_wav:
@@ -173,11 +382,14 @@ def process(req, model, ref_matrix, speaker_name):
             send({"progress": int(n)})
 
         # VAD on the 16 kHz filtered audio.
-        speech, segments = load_speech(input_wav, model)
+        speech, sr = sf.read(input_wav, dtype="float32")
+        if sr != SAMPLE_RATE:
+            raise RuntimeError(f"Unexpected sample rate {sr} for {input_wav}; expected {SAMPLE_RATE}")
+        segments = detect_segments(speech, vad)
         # ASR + speaker labelling: report 20..100 so the Rust backend keeps the
         # 0..20 range for DeepFilterNet denoising.
         utterances = transcribe_samples(
-            speech, segments, model, ref_matrix, speaker_name,
+            speech, segments, asr, vad, spk, ref_matrix, speaker_name,
             on_progress=lambda p: progress(20 + p * 0.8),
         )
         send({"cmd": "process", "id": rid, "ok": True, "utterances": utterances})
@@ -188,43 +400,54 @@ def process(req, model, ref_matrix, speaker_name):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--model-dir", required=True,
-                    help="dir containing SenseVoiceSmall/fsmn-vad/cam++")
-    ap.add_argument("--ref-dir", default="",
-                    help="optional dir with 16 kHz mono reference wav files for speaker labelling")
-    ap.add_argument("--speaker-name", default="speaker",
-                    help="display name for the reference speaker in transcripts")
+    ap.add_argument("--config", required=True,
+                    help="path to the JSON audio-model configuration written by the app")
     args = ap.parse_args()
+
+    try:
+        with open(args.config, "r", encoding="utf-8") as f:
+            config = json.load(f)
+    except Exception as e:
+        send({"cmd": "ready", "ok": False, "error": f"cannot read model config: {e}"})
+        return
+
+    if AutoModel is None or torch is None or sf is None or np is None:
+        send({
+            "cmd": "ready",
+            "ok": False,
+            "error": f"required Python libraries are not importable: {_IMPORT_ERROR}",
+        })
+        return
 
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     log.info(f"Device: {device}")
 
-    log.info("Loading models...")
+    spk = None
+    ref_matrix = None
+    ref_paths = []
     try:
         with quiet_stdout():
-            # One AutoModel call builds the ASR model plus the VAD and speaker sub-models; the same paths/config as before, just unified.
-            model = AutoModel(
-                model=os.path.join(args.model_dir, "SenseVoiceSmall"),
-                vad_model=os.path.join(args.model_dir, "fsmn-vad"),
-                spk_model=os.path.join(args.model_dir, "cam++"),
-                device=device,
-                disable_update=True,
-                disable_pbar=True,
-                trust_remote_code=True
-            )
-
-            # The SPK model always loads; a reference voiceprint is optional.
-            ref_paths = sorted(glob.glob(os.path.join(args.ref_dir, "*.wav"))) if args.ref_dir else []
-            if ref_paths:
-                ref_matrix = np.stack([build_reference(p, model) for p in ref_paths])
-            else:
-                ref_matrix = None
+            vad = load_vad((config.get("vad") or {}).get("dir", ""), device)
+            asr = build_asr(config, device)
+            spk_cfg = config.get("spk") or {}
+            if spk_cfg.get("dir"):
+                spk = load_spk(spk_cfg["dir"], device)
+            ref_cfg = config.get("ref") or {}
+            ref_dir = ref_cfg.get("dir", "")
+            if spk is not None and ref_dir:
+                ref_paths = sorted(glob.glob(os.path.join(ref_dir, "*.wav")))
+                if ref_paths:
+                    ref_matrix = np.stack([build_reference(p, vad, spk) for p in ref_paths])
     except Exception as e:
         log.exception("model load failed")
         send({"cmd": "ready", "ok": False, "error": str(e)})
         return
-    if ref_matrix is not None:
-        log.info(f"Reference voiceprints: {len(ref_paths)} file(s), speaker '{args.speaker_name}'")
+
+    speaker_name = (config.get("ref") or {}).get("name", "speaker")
+    if spk is None:
+        log.info("No SPK model configured: speaker identification is disabled")
+    elif ref_matrix is not None:
+        log.info(f"Reference voiceprints: {len(ref_paths)} file(s), speaker '{speaker_name}'")
     else:
         log.info("No speaker reference: utterances will not be tagged with a specific speaker")
 
@@ -233,7 +456,8 @@ def main():
         sys.stdout.reconfigure(encoding="utf-8")
     except Exception:
         pass
-    send({"cmd": "ready", "ok": True, "engine": "audio"})
+    send({"cmd": "ready", "ok": True, "engine": "audio", "asr": asr.name,
+          "spk": spk is not None})
 
     for line in sys.stdin:
         line = line.strip()
@@ -249,7 +473,7 @@ def main():
             log.info("shutdown")
             break
         elif cmd == "process":
-            process(req, model, ref_matrix, args.speaker_name)
+            process(req, asr, vad, spk, ref_matrix, speaker_name)
         else:
             send({"cmd": cmd, "id": req.get("id", ""), "ok": False,
                   "error": f"unknown cmd {cmd}"})

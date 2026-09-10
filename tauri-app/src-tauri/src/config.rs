@@ -4,8 +4,6 @@ use std::path::PathBuf;
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AppConfig {
-    /// Python interpreter used to run the worker scripts ("python", "py", full path...).
-    pub python_cmd: String,
     /// Path to the user's Visual model directory.
     pub videoneko_model_dir: String,
     /// Summarization engine: "api" | "ollama" | "llamacpp"
@@ -49,7 +47,6 @@ pub struct AppConfig {
 impl AppConfig {
     pub fn new() -> Self {
         Self {
-            python_cmd: "python".to_string(),
             videoneko_model_dir: String::new(),
             engine: "api".to_string(),
             custom_prompt: String::new(),

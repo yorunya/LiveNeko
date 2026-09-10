@@ -31,9 +31,6 @@ pub struct Cookie {
     pub value: String,
     /// As stored, e.g. ".youtube.com" or "www.bilibili.com".
     pub domain: String,
-    /// Kept for completeness; requests are matched by host only.
-    #[allow(dead_code)]
-    pub path: String,
     /// Unix seconds; None = session cookie.
     pub expires: Option<i64>,
     pub secure: bool,
@@ -151,7 +148,7 @@ fn extract_firefox(on_log: &dyn Fn(&str)) -> Result<Vec<Cookie>, String> {
     }
     let ms_expiry = schema >= 16;
     let mut stmt = conn
-        .prepare("SELECT host, name, value, path, expiry, isSecure FROM moz_cookies")
+        .prepare("SELECT host, name, value, expiry, isSecure FROM moz_cookies")
         .map_err(|e| format!("firefox cookies query: {e}"))?;
     let rows = stmt
         .query_map([], |r| {
@@ -159,22 +156,20 @@ fn extract_firefox(on_log: &dyn Fn(&str)) -> Result<Vec<Cookie>, String> {
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, Option<i64>>(4)?,
-                r.get::<_, i64>(5)?,
+                r.get::<_, Option<i64>>(3)?,
+                r.get::<_, i64>(4)?,
             ))
         })
         .map_err(|e| format!("firefox cookies query: {e}"))?;
     let mut out = Vec::new();
     for row in rows.flatten() {
-        let (host, name, value, path, expiry, secure) = row;
+        let (host, name, value, expiry, secure) = row;
         // FF142+ stores milliseconds; yt-dlp divides by 1000.
         let expires = expiry.map(|e| if ms_expiry { e / 1000 } else { e });
         out.push(Cookie {
             name,
             value,
             domain: host,
-            path,
             expires,
             secure: secure != 0,
         });
@@ -231,7 +226,7 @@ fn extract_chromium(browser: &str, on_log: &dyn Fn(&str)) -> Result<Vec<Cookie>,
         "secure"
     };
     let sql = format!(
-        "SELECT host_key, name, value, encrypted_value, path, expires_utc, {secure_col} FROM cookies"
+        "SELECT host_key, name, value, encrypted_value, expires_utc, {secure_col} FROM cookies"
     );
     let mut stmt = conn.prepare(&sql).map_err(|e| format!("{browser} cookies query: {e}"))?;
     let rows = stmt
@@ -241,9 +236,8 @@ fn extract_chromium(browser: &str, on_log: &dyn Fn(&str)) -> Result<Vec<Cookie>,
                 r.get::<_, Vec<u8>>(1)?,
                 r.get::<_, Vec<u8>>(2)?,
                 r.get::<_, Vec<u8>>(3)?,
-                r.get::<_, String>(4)?,
+                r.get::<_, i64>(4)?,
                 r.get::<_, i64>(5)?,
-                r.get::<_, i64>(6)?,
             ))
         })
         .map_err(|e| format!("{browser} cookies query: {e}"))?;
@@ -260,7 +254,7 @@ fn extract_chromium(browser: &str, on_log: &dyn Fn(&str)) -> Result<Vec<Cookie>,
     let mut failed = 0usize;
     let mut out = Vec::new();
     for row in rows.flatten() {
-        let (host_key, name, value, encrypted_value, path, expires_utc, secure) = row;
+        let (host_key, name, value, encrypted_value, expires_utc, secure) = row;
         let text = if !value.is_empty() {
             Some(String::from_utf8_lossy(&value).to_string())
         } else if encrypted_value.is_empty() {
@@ -285,7 +279,6 @@ fn extract_chromium(browser: &str, on_log: &dyn Fn(&str)) -> Result<Vec<Cookie>,
             name: String::from_utf8_lossy(&name).to_string(),
             value,
             domain: String::from_utf8_lossy(&host_key).to_string(),
-            path,
             expires,
             secure: secure != 0,
         });
@@ -494,7 +487,6 @@ mod tests {
             name: name.into(),
             value: "v".into(),
             domain: domain.into(),
-            path: "/".into(),
             expires: None,
             secure: false,
         }
@@ -519,7 +511,6 @@ mod tests {
                 name: "OLD".into(),
                 value: "v".into(),
                 domain: ".bilibili.com".into(),
-                path: "/".into(),
                 expires: Some(1), // long expired
                 secure: false,
             },

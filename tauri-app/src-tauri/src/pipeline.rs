@@ -162,7 +162,7 @@ impl Runner {
     pub fn start_model_servers(&mut self, config: &AppConfig) -> Result<(), String> {
         let cancel = self.handle.cancel.clone();
         let pids = self.handle.model_pids.clone();
-        let python = config.python_cmd.clone();
+        let python = crate::commands::PYTHON_CMD.to_string();
 
         // The speaker reference is optional: when none is configured the SPK model still loads, but utterances are not tagged with a specific speaker.
         let mut audio_args = vec![
@@ -968,14 +968,9 @@ pub fn simplify_title_str(raw: &str) -> String {
 }
 
 /// Probe the video title(s) a URL yields. Used to show the real title in the queue immediately when a URL is added.
-/// `yt_dlp_exe` is kept for API compatibility but is no longer used; titles are
-/// fetched in-process via `crate::downloader`. `cookie_browser` optionally
-/// enables reading that browser's cookies for the probe.
-pub fn probe_ytdlp_titles(
-    _yt_dlp_exe: &Path,
-    url: &str,
-    cookie_browser: &str,
-) -> Result<Vec<String>, String> {
+/// Titles are fetched in-process via `crate::downloader`. `cookie_browser`
+/// optionally enables reading that browser's cookies for the probe.
+pub fn probe_ytdlp_titles(url: &str, cookie_browser: &str) -> Result<Vec<String>, String> {
     let cancel = Arc::new(AtomicBool::new(false));
     let on_progress = Arc::new(Mutex::new(Box::new(|_: u8| {}) as Box<dyn FnMut(u8) + Send>));
     let on_log = Arc::new(Mutex::new(

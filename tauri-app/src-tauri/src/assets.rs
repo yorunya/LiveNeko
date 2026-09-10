@@ -4,7 +4,6 @@ use tauri::{AppHandle, Manager};
 /// Resolved locations of all bundled assets. During development these fall back to the repo root; in production they resolve from the resource directory.
 #[derive(Clone, Debug)]
 pub struct Assets {
-    pub yt_dlp_exe: PathBuf,
     pub prompt_md: PathBuf,
     pub scripts_dir: PathBuf,
     pub audio_model_dir: PathBuf,
@@ -57,7 +56,6 @@ impl Assets {
         };
 
         Self {
-            yt_dlp_exe: pick("yt-dlp.exe"),
             prompt_md: pick("prompt.md"),
             scripts_dir: pick("scripts"),
             audio_model_dir: pick("model"),

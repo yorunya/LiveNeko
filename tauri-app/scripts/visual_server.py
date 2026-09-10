@@ -1,7 +1,7 @@
 """Resident IPC visual worker for the LiveNeko Tauri app.
 
 Launched once by the Rust backend at the start of a pipeline run. Loads the
-VideoNeko ViT model a single time, then stays alive reading JSON requests on stdin and writing JSON responses on stdout until told to shut down. The model is NOT reloaded between requests (switching models is done via a "load" cmd).
+VideoNeko ViT model a single time, then stays alive reading JSON requests on stdin and writing JSON responses on stdout until told to shut down. The model is NOT reloaded between requests.
 
 This worker does ONLY model inference. Video decoding and resizing are done by the Rust backend via ffmpeg (hardware-accelerated), which writes the sampled frames to a raw RGB24 blob (one frame = height*width*3 bytes). The Rust backend also owns the smoothing, interval merging, timestamp formatting, and result-file writing; it receives raw per-second label predictions back.
 
@@ -9,7 +9,6 @@ Protocol (newline-delimited JSON on stdin/stdout):
   Request:  {"cmd":"predict","id":"<id>","input":"<frames.raw>"}
   Response: {"cmd":"predict","id":"<id>","ok":true,"preds":["<label>", ...]}
             {"cmd":"predict","id":"<id>","ok":false,"error":"..."}
-  Switch model: {"cmd":"load","model_dir":"<dir>"}   (optional, for per-seq models)
   Shutdown: {"cmd":"shutdown"}
 Progress is emitted on stdout as {"progress":N} lines while working.
 """
@@ -163,13 +162,11 @@ def _load_vit(model_dir, device):
 
 
 def load_model(model_dir):
-    global _model, _id2label, _size_hw, _mean, _std, _model_dir, _batch
+    global _model, _id2label, _size_hw, _mean, _std, _model_dir
     with quiet_stdout():
         processor = ViTImageProcessor.from_pretrained(model_dir)
         _model = _load_vit(model_dir, _device)
     _model_dir = model_dir
-    # a different model has a different footprint — recompute the batch size
-    _batch = None
     _model.eval()
     _id2label = {int(k): v for k, v in _model.config.id2label.items()}
     size = processor.size
@@ -324,12 +321,6 @@ def main():
         if cmd == "shutdown":
             log.info("shutdown")
             break
-        elif cmd == "load":
-            try:
-                load_model(req.get("model_dir", ""))
-                send({"cmd": "load", "id": req.get("id", ""), "ok": True})
-            except Exception as e:
-                send({"cmd": "load", "id": req.get("id", ""), "ok": False, "error": str(e)})
         elif cmd == "predict":
             handle_predict(req)
         else:

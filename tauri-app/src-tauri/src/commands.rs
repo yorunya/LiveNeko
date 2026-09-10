@@ -76,7 +76,7 @@ pub fn check_environment(
         }
     }
 
-    let report = run_environment_check(&app, &cfg);
+    let report = run_environment_check(&app);
     let _ = std::fs::write(&env_report_path, report.to_string());
     cfg.env_checked = true;
     let _ = cfg.save(&state.app_data_dir);
@@ -84,10 +84,13 @@ pub fn check_environment(
     Ok(report)
 }
 
-fn run_environment_check(app: &AppHandle, cfg: &AppConfig) -> serde_json::Value {
+/// Interpreter used to run all Python worker scripts (must be on PATH).
+pub(crate) const PYTHON_CMD: &str = "python";
+
+fn run_environment_check(app: &AppHandle) -> serde_json::Value {
     let assets = Assets::resolve(app);
 
-    let python_check = run_capture(&cfg.python_cmd, &["--version"]);
+    let python_check = run_capture(PYTHON_CMD, &["--version"]);
     let python_ok = python_check.is_ok();
     let python_version = python_check.unwrap_or_default();
     let ffmpeg_ok = run_capture("ffmpeg", &["-version"]).is_ok();
@@ -100,7 +103,7 @@ fn run_environment_check(app: &AppHandle, cfg: &AppConfig) -> serde_json::Value 
         let script = assets.scripts_dir.join("env_check.py");
         if script.exists() {
             if let Ok(out) =
-                run_capture_cwd(&cfg.python_cmd, &["-u", script.to_str().unwrap()], None)
+                run_capture_cwd(PYTHON_CMD, &["-u", script.to_str().unwrap()], None)
             {
                 if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&out) {
                     cuda = parsed
@@ -116,13 +119,12 @@ fn run_environment_check(app: &AppHandle, cfg: &AppConfig) -> serde_json::Value 
     }
 
     serde_json::json!({
-        "python": { "command": cfg.python_cmd, "ok": python_ok, "version": python_version },
+        "python": { "command": PYTHON_CMD, "ok": python_ok, "version": python_version },
         "ffmpeg": ffmpeg_ok,
         "cuda": cuda,
         "pythonLibraries": python_libs_ok,
         "libraries": libs,
         "assets": {
-            "ytDlp": assets.yt_dlp_exe.exists(),
             "promptMd": assets.prompt_md.exists(),
             "scripts": assets.scripts_dir.exists(),
         },
@@ -192,9 +194,6 @@ pub fn save_config(
     // preserve backend-managed fields that the settings UI does not send
     let existing = state.config.lock().unwrap().clone();
     config.env_checked = existing.env_checked;
-    if config.python_cmd.trim().is_empty() {
-        config.python_cmd = existing.python_cmd.clone();
-    }
     config.normalize();
 
     // Speaker reference handling: the WAV is imported (16 kHz-checked, converted when needed) into <app_data>/spk/ at save time, so the file persists with the settings.
@@ -394,7 +393,6 @@ pub fn get_queue(state: State<'_, AppState>) -> Vec<QueueItem> {
 
 #[tauri::command]
 pub async fn add_url(
-    app: AppHandle,
     state: State<'_, AppState>,
     url: String,
     title: Option<String>,
@@ -402,13 +400,12 @@ pub async fn add_url(
     if !url.starts_with("http") {
         return Err("URL must start with http:// or https://".to_string());
     }
-    // Use the caller-provided title, otherwise probe the real video title with yt-dlp so the queue shows it instead of a placeholder.
+    // Use the caller-provided title, otherwise probe the real video title in-process so the queue shows it instead of a placeholder.
     let title = match title {
         Some(t) if !t.trim().is_empty() => t,
         _ => {
-            let assets = crate::assets::Assets::resolve(&app);
             let cookie_browser = state.config.lock().unwrap().cookie_browser.clone();
-            match crate::pipeline::probe_ytdlp_titles(&assets.yt_dlp_exe, &url, &cookie_browser) {
+            match crate::pipeline::probe_ytdlp_titles(&url, &cookie_browser) {
                 Ok(titles) => titles
                     .first()
                     .map(|t| crate::pipeline::simplify_title_str(t))
@@ -488,7 +485,6 @@ pub fn start_pipeline(app: AppHandle, state: State<'_, AppState>) -> Result<(), 
 
     let app2 = app.clone();
     let handle = state.pipeline.clone();
-    let work_root = work_root;
 
     std::thread::spawn(move || {
         let mut runner =

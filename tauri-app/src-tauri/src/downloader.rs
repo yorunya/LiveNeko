@@ -1785,7 +1785,6 @@ mod tests {
             name: name.into(),
             value: value.into(),
             domain: ".youtube.com".into(),
-            path: "/".into(),
             expires: None,
             secure: true,
         };
@@ -1806,7 +1805,14 @@ mod tests {
         // no cookies at all -> no auth header
         assert!(new_dl(None).sid_authorization().is_none());
         // cookies not matching youtube -> no auth header
-        assert!(new_dl(Some(Arc::new(vec![mk("SAPISID", "other")]))).sid_authorization().is_none());
+        let off_domain = Cookie {
+            name: "SAPISID".into(),
+            value: "x".into(),
+            domain: ".example.org".into(),
+            expires: None,
+            secure: false,
+        };
+        assert!(new_dl(Some(Arc::new(vec![off_domain]))).sid_authorization().is_none());
         // SAPISID + 3PAPISID -> SAPISIDHASH and SAPISID3PHASH, no 1PHASH
         let auth = new_dl(Some(Arc::new(vec![
             mk("SAPISID", "testSapisid123"),

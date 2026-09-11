@@ -31,10 +31,10 @@ pub fn log_line(
     item_id: &str,
     line: &str,
 ) {
-    if let Ok(mut guard) = log_file.lock() {
-        if let Some(f) = guard.as_mut() {
-            let _ = writeln!(f, "[{item_id}] {line}");
-        }
+    if let Ok(mut guard) = log_file.lock()
+        && let Some(f) = guard.as_mut()
+    {
+        let _ = writeln!(f, "[{item_id}] {line}");
     }
     let _ = app.emit(
         "pipeline://log",
@@ -75,10 +75,8 @@ impl ModelServer {
         let stderr = child.stderr.take().expect("stderr piped");
         std::thread::spawn(move || {
             let reader = BufReader::new(stderr);
-            for line in reader.lines() {
-                if let Ok(l) = line {
-                    log_line(&app2, &log_file2, "model-server", &l);
-                }
+            for l in reader.lines().map_while(Result::ok) {
+                log_line(&app2, &log_file2, "model-server", &l);
             }
         });
 

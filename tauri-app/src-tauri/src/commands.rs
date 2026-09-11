@@ -50,10 +50,10 @@ fn emit_app(app: &AppHandle, event: &str, payload: serde_json::Value) {
 
 fn ensure_assets(app: &AppHandle, cfg: &AppConfig) -> Result<Assets, String> {
     let assets = Assets::resolve(app);
-    if !assets.filter_model_present() {
+    if !assets.silero_model.exists() {
         return Err(format!(
-            "DeepFilterNet model missing at {}",
-            assets.filter_model_tar.display()
+            "Silero VAD model missing at {}",
+            assets.silero_model.display()
         ));
     }
     if !assets.model_tools_script().exists() {
@@ -75,7 +75,7 @@ fn ensure_assets(app: &AppHandle, cfg: &AppConfig) -> Result<Assets, String> {
             })
             .unwrap_or_default();
         return Err(if errors.is_empty() {
-            "FunASR model configuration is incomplete — open Settings and configure the ASR/VAD models"
+            "FunASR model configuration is incomplete — open Settings and configure the ASR model"
                 .to_string()
         } else {
             format!("FunASR model configuration invalid: {errors}")
@@ -116,13 +116,7 @@ pub(crate) fn validate_model_config_impl(
             }),
         );
     }
-    checks.insert(
-        "vad".to_string(),
-        serde_json::json!({
-            "kind": "vad", "enabled": true,
-            "type": "fsmn-vad", "dir": cfg.vad_model_dir.trim(),
-        }),
-    );
+    // No "vad" slot: VAD is the bundled native Silero model (no user config).
     if cfg.spk_enabled && !cfg.spk_model_dir.trim().is_empty() {
         checks.insert(
             "spk".to_string(),
@@ -172,12 +166,13 @@ pub fn check_environment(
     // Environment check runs only once per machine unless forced (Re-check button).
     let env_report_path = state.app_data_dir.join("env_report.json");
     let mut cfg = state.config.lock().unwrap().clone();
-    if !force.unwrap_or(false) && cfg.env_checked && env_report_path.exists() {
-        if let Ok(text) = std::fs::read_to_string(&env_report_path) {
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) {
-                return Ok(parsed);
-            }
-        }
+    if !force.unwrap_or(false)
+        && cfg.env_checked
+        && env_report_path.exists()
+        && let Ok(text) = std::fs::read_to_string(&env_report_path)
+        && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text)
+    {
+        return Ok(parsed);
     }
 
     let report = run_environment_check(&app);
@@ -206,24 +201,22 @@ fn run_environment_check(app: &AppHandle) -> serde_json::Value {
     let mut python_libs_ok = false;
     if python_ok {
         let script = assets.scripts_dir.join("env_check.py");
-        if script.exists() {
-            if let Ok(out) =
+        if script.exists()
+            && let Ok(out) =
                 run_capture_cwd(PYTHON_CMD, &["-u", script.to_str().unwrap()], None)
-            {
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&out) {
-                    cuda = parsed
-                        .get("cuda")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    // env_check.py emits {"cuda": .., "libraries": {..}}; the frontend expects the flat per-library object under "libraries", so unwrap it here.
-                    libs = parsed.get("libraries").cloned().unwrap_or_default();
-                    download_libs = parsed
-                        .get("downloadLibraries")
-                        .cloned()
-                        .unwrap_or_default();
-                    python_libs_ok = true;
-                }
-            }
+            && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&out)
+        {
+            cuda = parsed
+                .get("cuda")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            // env_check.py emits {"cuda": .., "libraries": {..}}; the frontend expects the flat per-library object under "libraries", so unwrap it here.
+            libs = parsed.get("libraries").cloned().unwrap_or_default();
+            download_libs = parsed
+                .get("downloadLibraries")
+                .cloned()
+                .unwrap_or_default();
+            python_libs_ok = true;
         }
     }
 
@@ -500,7 +493,6 @@ pub fn get_setup_status(state: State<'_, AppState>) -> Result<serde_json::Value,
         "funasrModelsDir": cfg.funasr_models_dir,
         "asrType": cfg.asr_type,
         "asrModelDir": cfg.asr_model_dir,
-        "vadModelDir": cfg.vad_model_dir,
         "spkModelDir": cfg.spk_model_dir,
     }))
 }
@@ -937,7 +929,7 @@ fn make_snippet(
         let hi = next_char_boundary(haystack, end + 60);
         let mut snip = haystack[lo..hi].to_string();
         if lo > 0 {
-            snip.insert_str(0, "…");
+            snip.insert(0, '…');
         }
         if hi < haystack.len() {
             snip.push('…');
@@ -1103,7 +1095,7 @@ pub async fn validate_model_config(
 
 /// Download a model snapshot from Hugging Face / ModelScope into the model
 /// directory. Progress is emitted as `model://progress` events with
-/// `{ "kind": "asr"|"vad"|"spk", "progress": 0..100 }`.
+/// `{ "kind": "asr"|"spk", "progress": 0..100 }`.
 #[tauri::command]
 pub async fn download_model(
     app: AppHandle,
@@ -1114,8 +1106,8 @@ pub async fn download_model(
     dest: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let kind = kind.trim().to_lowercase();
-    if !matches!(kind.as_str(), "asr" | "vad" | "spk") {
-        return Err("model kind must be 'asr', 'vad' or 'spk'".to_string());
+    if !matches!(kind.as_str(), "asr" | "spk") {
+        return Err("model kind must be 'asr' or 'spk'".to_string());
     }
     let source = source.trim().to_lowercase();
     if !matches!(source.as_str(), "huggingface" | "hf" | "modelscope" | "ms") {

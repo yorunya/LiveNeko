@@ -32,11 +32,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// A minimal blocking HTTP client backed by `curl` (bundled with Windows 10+).
 /// This avoids pulling a full HTTP/TLS stack into the binary while still
-
 struct HttpClient {
     /// Additional headers that every request should carry.
     default_headers: Vec<(String, String)>,
 }
+
+/// Shared progress/log callbacks handed to the downloader (`Arc` so the caller
+/// can keep a copy while the downloader holds one).
+type ProgressCb = Arc<Mutex<Box<dyn FnMut(u8) + Send>>>;
+type LogCb = Arc<Mutex<Box<dyn FnMut(String) + Send>>>;
 
 impl HttpClient {
     fn new() -> Self {
@@ -124,11 +128,11 @@ impl HttpClient {
         dest: &Path,
         extra_headers: &[(&str, &str)],
         cancel: &Arc<AtomicBool>,
-        on_progress: Arc<Mutex<Box<dyn FnMut(u8) + Send>>>,
+        on_progress: ProgressCb,
     ) -> Result<(), String> {
         let part = part_path(url);
         let mut start = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
-        let report = |on_progress: &Arc<Mutex<Box<dyn FnMut(u8) + Send>>>, p: u8| {
+        let report = |on_progress: &ProgressCb, p: u8| {
             let mut cb = on_progress.lock().unwrap();
             (cb)(p);
         };
@@ -326,8 +330,8 @@ impl HttpClient {
         dest: &Path,
         extra_headers: &[(&str, &str)],
         cancel: &Arc<AtomicBool>,
-        report: &dyn Fn(&Arc<Mutex<Box<dyn FnMut(u8) + Send>>>, u8),
-        on_progress: &Arc<Mutex<Box<dyn FnMut(u8) + Send>>>,
+        report: &dyn Fn(&ProgressCb, u8),
+        on_progress: &ProgressCb,
     ) -> Result<(), String> {
         let mut cmd = std::process::Command::new("curl");
         cmd.arg("-sS")
@@ -416,7 +420,7 @@ mod md5 {
         }
         msg.extend_from_slice(&bit_len.to_le_bytes());
 
-        for chunk in msg.chunks_exact(64) {
+        for chunk in msg.as_chunks::<64>().0 {
             let mut m = [0u32; 16];
             for (i, w) in m.iter_mut().enumerate() {
                 *w = u32::from_le_bytes([
@@ -463,11 +467,11 @@ fn urlencode(s: &str) -> String {
 
 /// Extract a query parameter value from a URL string.
 fn query_param(url: &str, key: &str) -> Option<String> {
-    let q = url.splitn(2, '?').nth(1)?;
+    let q = url.split_once('?')?.1;
     for pair in q.split('&') {
         let mut it = pair.splitn(2, '=');
         if it.next() == Some(key) {
-            return it.next().map(|v| urlencoding_decode(v));
+            return it.next().map(urlencoding_decode);
         }
     }
     None
@@ -502,9 +506,9 @@ pub struct Downloader {
     ffmpeg: String,
     cancel: Arc<AtomicBool>,
     /// Progress callback: (percent 0..100).
-    on_progress: Arc<Mutex<Box<dyn FnMut(u8) + Send>>>,
+    on_progress: ProgressCb,
     /// Log callback.
-    on_log: Arc<Mutex<Box<dyn FnMut(String) + Send>>>,
+    on_log: LogCb,
     /// Optional browser cookies (yt-dlp --cookies-from-browser equivalent).
     cookies: Option<Arc<Vec<Cookie>>>,
 }
@@ -512,8 +516,8 @@ pub struct Downloader {
 impl Downloader {
     pub fn new(
         cancel: Arc<AtomicBool>,
-        on_progress: Arc<Mutex<Box<dyn FnMut(u8) + Send>>>,
-        on_log: Arc<Mutex<Box<dyn FnMut(String) + Send>>>,
+        on_progress: ProgressCb,
+        on_log: LogCb,
         cookies: Option<Arc<Vec<Cookie>>>,
     ) -> Self {
         Self {
@@ -710,9 +714,10 @@ impl Downloader {
                 .get_json(&format!("https://api.bilibili.com/x/web-interface/view?{q}"), &api_headers_ref)
             {
                 let code = v.get("code").and_then(Value::as_i64).unwrap_or(-1);
-                if code == 0 {
-                    if let Some(d) = v.get("data") {
-                        let bvid = d
+                if code == 0
+                    && let Some(d) = v.get("data")
+                {
+                    let bvid = d
                             .get("bvid")
                             .and_then(Value::as_str)
                             .unwrap_or("")
@@ -744,9 +749,8 @@ impl Downloader {
                                 pages.push((1, cid, title.clone()));
                             }
                         }
-                        if !bvid.is_empty() && !pages.is_empty() {
-                            return Ok(BiliMeta { bvid, title, pages });
-                        }
+                    if !bvid.is_empty() && !pages.is_empty() {
+                        return Ok(BiliMeta { bvid, title, pages });
                     }
                 }
             }
@@ -825,10 +829,10 @@ impl Downloader {
         static CACHE: Mutex<Option<(String, Instant)>> = Mutex::new(None);
         {
             let guard = CACHE.lock().unwrap();
-            if let Some((key, ts)) = guard.as_ref() {
-                if ts.elapsed() < Duration::from_secs(30) {
-                    return Ok(key.clone());
-                }
+            if let Some((key, ts)) = guard.as_ref()
+                && ts.elapsed() < Duration::from_secs(30)
+            {
+                return Ok(key.clone());
             }
         }
         let nav_headers: Vec<(&str, String)> = {
@@ -1580,10 +1584,10 @@ struct BiliMeta {
 
 /// Extract the Bilibili video id from a URL. Returns `(id, is_bvid)`.
 fn bilibili_id_from_url(url: &str) -> Option<(String, bool)> {
-    if let Some(rest) = query_param(url, "bvid") {
-        if !rest.is_empty() {
-            return Some((rest, true));
-        }
+    if let Some(rest) = query_param(url, "bvid")
+        && !rest.is_empty()
+    {
+        return Some((rest, true));
     }
     if let Some(pos) = url.find("/video/") {
         let rest = &url[pos + 7..];
@@ -1645,7 +1649,7 @@ fn youtube_video_id(url: &str) -> Option<String> {
     // youtu.be/<id>
     if let Some(rest) = url.strip_prefix("https://youtu.be/") {
         return Some(
-            rest.split(|c| c == '?' || c == '&' || c == '/')
+            rest.split(['?', '&', '/'])
                 .next()?
                 .to_string(),
         );
@@ -1663,7 +1667,7 @@ fn youtube_video_id(url: &str) -> Option<String> {
         if let Some(pos) = url.find(pat) {
             let rest = &url[pos + pat.len()..];
             return Some(
-                rest.split(|c| c == '?' || c == '&' || c == '/')
+                rest.split(['?', '&', '/'])
                     .next()?
                     .to_string(),
             );

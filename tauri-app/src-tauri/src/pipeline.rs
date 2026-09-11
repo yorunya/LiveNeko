@@ -1,6 +1,5 @@
 use crate::assets::Assets;
 use crate::config::AppConfig;
-use crate::df_denoise::Denoiser;
 use crate::model_ipc::{ModelServer, log_line};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -138,7 +137,10 @@ pub struct Runner {
 
 /// Serialize the audio worker configuration (ASR backend, VAD/SPK model
 /// directories and the optional speaker reference) for `audio_server.py`.
-fn build_audio_config(config: &AppConfig, refs: Option<(&Path, &str)>) -> serde_json::Value {
+fn build_audio_config(
+    config: &AppConfig,
+    refs: Option<(&Path, &str, &[crate::silero_vad::Segment])>,
+) -> serde_json::Value {
     let asr = if config.asr_is_api() {
         serde_json::json!({
             "backend": "qwen3-api",
@@ -161,14 +163,20 @@ fn build_audio_config(config: &AppConfig, refs: Option<(&Path, &str)>) -> serde_
         serde_json::Value::Null
     };
     let refs_json = match refs {
-        Some((dir, name)) => {
-            serde_json::json!({ "dir": dir.display().to_string(), "name": name })
-        }
+        Some((wav, name, segments)) => serde_json::json!({
+            "file": wav.display().to_string(),
+            "name": name,
+            // Speech segments of the reference wav, pre-computed by the native
+            // Silero VAD — the worker no longer runs a VAD model itself.
+            "segments": segments
+                .iter()
+                .map(|s| [s.start_ms, s.end_ms])
+                .collect::<Vec<_>>(),
+        }),
         None => serde_json::Value::Null,
     };
     serde_json::json!({
         "asr": asr,
-        "vad": { "dir": config.vad_model_dir.trim() },
         "spk": spk,
         "ref": refs_json,
     })
@@ -202,19 +210,48 @@ impl Runner {
         let pids = self.handle.model_pids.clone();
         let python = crate::commands::PYTHON_CMD.to_string();
 
-        // Build the audio worker configuration (ASR backend + VAD/SPK paths)
-        // and hand it to the resident worker as a JSON file. The user provides
-        // all FunASR models; nothing is bundled.
-        // Resolve the speaker reference only when a SPK model is actually in
-        // use; without one, speaker identification stays disabled even if a
-        // speaker name/reference was saved earlier.
+        // Build the audio worker configuration (ASR backend + SPK path) and
+        // hand it to the resident worker as a JSON file. VAD is native Rust
+        // (bundled Silero ONNX, see silero_vad.rs); the user provides the
+        // FunASR ASR/SPK models. Resolve the speaker reference only when a
+        // SPK model is actually in use; without one, speaker identification
+        // stays disabled even if a speaker name/reference was saved earlier.
         let spk_active = config.spk_enabled && !config.spk_model_dir.trim().is_empty();
         let refs = if spk_active {
-            self.speaker_reference(config)?
+            match self.speaker_reference(config)? {
+                Some((wav, name)) => {
+                    let mut vad = crate::silero_vad::SileroVad::new(&self.assets.silero_model)?;
+                    let segments = crate::silero_vad::detect_wav_segments(
+                        &mut vad,
+                        &wav,
+                        &self.handle.cancel,
+                    )?;
+                    if segments.is_empty() {
+                        return Err(format!(
+                            "speaker reference {} contains no detectable speech — choose a clearer clip in Settings",
+                            wav.display()
+                        ));
+                    }
+                    self.emit_log(
+                        "pipeline",
+                        format!(
+                            "[model] reference voiceprint: {} segment(s) from {}",
+                            segments.len(),
+                            wav.display()
+                        ),
+                    );
+                    Some((wav, name, segments))
+                }
+                None => None,
+            }
         } else {
             None
         };
-        let audio_config = build_audio_config(config, refs.as_ref().map(|(d, n)| (d.as_path(), n.as_str())));
+        let audio_config = build_audio_config(
+            config,
+            refs.as_ref()
+                .map(|(w, n, segs)| (w.as_path(), n.as_str(), segs.as_slice())),
+        );
         let config_dir = self
             .app
             .path()
@@ -230,7 +267,7 @@ impl Runner {
         .map_err(|e| format!("write audio model config: {e}"))?;
 
         match &refs {
-            Some((_, speaker_name)) => {
+            Some((_, speaker_name, _)) => {
                 self.emit_log(
                     "pipeline",
                     format!("[model] speaker identification: {speaker_name}"),
@@ -269,7 +306,7 @@ impl Runner {
         let audio_script = self.assets.scripts_dir.join("audio_server.py");
         self.emit_log(
             "pipeline",
-            "[model] loading audio models (VAD/ASR/SPK)...".to_string(),
+            "[model] loading audio models (ASR/SPK); VAD is the bundled native Silero (CPU)...".to_string(),
         );
         let audio = ModelServer::spawn(
             &self.app,
@@ -324,7 +361,7 @@ impl Runner {
         }
     }
 
-    /// Resolve the configured speaker reference: `(reference dir, display name)` when a speaker is configured and its imported WAV exists, `None` when no speaker is configured. Errors when a speaker is configured but the reference WAV went missing (the user should re-save it in Settings).
+    /// Resolve the configured speaker reference: `(reference WAV path, display name)` when a speaker is configured and its imported WAV exists, `None` when no speaker is configured. Errors when a speaker is configured but the reference WAV went missing (the user should re-save it in Settings).
     fn speaker_reference(&self, config: &AppConfig) -> Result<Option<(PathBuf, String)>, String> {
         let name = config.speaker_name.trim();
         if name.is_empty() {
@@ -342,19 +379,19 @@ impl Runner {
                 "speaker \"{name}\" is configured but its reference WAV is missing — open Settings and choose it again"
             ));
         }
-        Ok(Some((dir, name.to_string())))
+        Ok(Some((wav, name.to_string())))
     }
 
-    /// Run, per part, in parallel: audio thread: ffmpeg extract 48 kHz (video -> raw_wav) -> Rust denoise (raw_wav -> filtered_16k_wav) -> Python VAD/ASR/SPK -> raw utterances visual thread: ffmpeg GPU decode (video -> frames_raw RGB blob) -> predict (frames_raw -> raw per-second labels) The model workers only run inference; Rust extracts, denoises, and writes the per-part asr.txt/visual.txt files from the returned raw results.
+    /// Run, per part, in parallel: audio thread: ffmpeg audio decode with the optional noise-reduction filters (video -> filtered_16k_wav, progress 0..20) -> native Silero VAD (filtered_16k_wav -> utterance segments, CPU) -> Python ASR/SPK -> raw utterances visual thread: ffmpeg GPU decode (video -> frames_raw RGB blob) -> predict (frames_raw -> raw per-second labels) The model workers only run inference; Rust extracts, filters, VADs, and writes the per-part asr.txt/visual.txt files from the returned raw results.
     pub fn run_audio_visual(
         &mut self,
         item_id: &str,
-        raw_wav: &Path,
         filtered_wav: &Path,
         video: &Path,
         frames_raw: &Path,
         asr_txt: &Path,
         visual_txt: &Path,
+        nr_filter: Option<&str>,
     ) -> Result<(), String> {
         let process_req = serde_json::json!({
             "cmd": "process",
@@ -376,6 +413,8 @@ impl Runner {
         let log_file = self.handle.log_file.clone();
         let part = self.current_part;
         let total_parts = self.total_parts;
+        let silero_model = self.assets.silero_model.clone();
+        let duration_secs = self.video_duration(video).ok();
 
         let audio_server = self
             .audio_server
@@ -385,34 +424,35 @@ impl Runner {
             .visual_server
             .as_mut()
             .ok_or("visual model server is not running")?;
-        // Run the audio chain (extract -> denoise -> ASR) and the visual chain (decode -> predict) concurrently.
-        let filter_model_tar = self.assets.filter_model_tar.clone();
+        // Run the audio chain (decode+NR -> VAD -> ASR) and the visual chain (decode -> predict) concurrently.
         let (audio_res, visual_res) = std::thread::scope(|s| {
             let a_app = app.clone();
             let a_id = id.clone();
             let a_pids = ffmpeg_pids.clone();
             let a_log = log_file.clone();
             let a_cancel = cancel.clone();
-            let a_filter_tar = filter_model_tar.clone();
+            let a_duration = duration_secs;
+            let a_nr_filter = nr_filter.map(|f| f.to_string());
+            let a_silero = silero_model.clone();
+            let mut process_req = process_req;
             let a = s.spawn(move || {
-                // Stage 2: extract raw 48 kHz audio.
-                run_ffmpeg(
-                    &a_app,
-                    &a_pids,
-                    &a_log,
-                    &a_cancel,
-                    &a_id,
-                    &ffmpeg_extract_args(video, raw_wav),
-                )?;
-                // Stage 2: Rust DeepFilterNet denoise (raw 48 kHz -> filtered 16 kHz), progress 0..20.
+                // Stage 2: ffmpeg audio decode (+ optional noise-reduction
+                // filters) into the 16 kHz mono WAV, progress 0..20.
                 {
                     let app2 = a_app.clone();
                     let id2 = a_id.clone();
-                    // Emit only when the percentage changes (0..20 => <=21 events). The denoiser reports once per hop; emitting each one flooded the webview IPC and crashed the app.
+                    // Emit only when the percentage changes (0..20 => <=21 events): each event is a full JSON round-trip to the webview and flooding it crashed the app.
                     let last = Arc::new(Mutex::new(None::<u8>));
-                    let mut denoiser = Denoiser::new(&a_filter_tar)?;
                     let progress_ctx = (app2, id2, last);
-                    denoiser.process_file(raw_wav, filtered_wav, &a_cancel, &|p| {
+                    let mut on_progress = move |out_time_us: u64| {
+                        let Some(dur) = a_duration else {
+                            return;
+                        };
+                        if dur == 0 {
+                            return;
+                        }
+                        let p = (((out_time_us as f64 / 1_000_000.0) / dur as f64) * 20.0) as u8;
+                        let p = p.min(20);
                         let (app2, id2, last) = &progress_ctx;
                         let mut last = last.lock().unwrap();
                         if *last == Some(p) {
@@ -429,9 +469,35 @@ impl Runner {
                                 "totalParts": total_parts,
                             }),
                         );
-                    })?;
+                    };
+                    run_ffmpeg(
+                        &a_app,
+                        &a_pids,
+                        &a_log,
+                        &a_cancel,
+                        &a_id,
+                        &ffmpeg_extract_args(video, filtered_wav, a_nr_filter.as_deref()),
+                        Some(&mut on_progress),
+                    )?;
                 }
-                // Stage 2: VAD/ASR/SPK (progress 20..100, emitted by audio_server).
+                // Stage 2: native Silero VAD on the extracted audio (CPU; a few
+                // ms of model load and well under a second of inference per
+                // minute of audio, so it needs no progress range of its own).
+                let mut vad = crate::silero_vad::SileroVad::new(&a_silero)?;
+                let segments = crate::silero_vad::detect_wav_segments(&mut vad, filtered_wav, &a_cancel)?;
+                crate::model_ipc::log_line(
+                    &a_app,
+                    &a_log,
+                    &a_id,
+                    &format!("[audio] VAD: {} utterance(s)", segments.len()),
+                );
+                process_req["segments"] = serde_json::json!(
+                    segments
+                        .iter()
+                        .map(|s| [s.start_ms, s.end_ms])
+                        .collect::<Vec<_>>()
+                );
+                // Stage 2: ASR/SPK (progress 20..100, emitted by audio_server).
                 audio_server.request(&a_app, &a_id, 2, part, total_parts, process_req)
             });
             let v_pids = ffmpeg_pids.clone();
@@ -455,6 +521,7 @@ impl Runner {
                     &cancel,
                     &id,
                     &ffmpeg_decode_args(video, frames_raw, v_h, v_w),
+                    None,
                 )?;
                 let _ = app.emit(
                     "pipeline://stage",
@@ -913,25 +980,24 @@ fn split_think_summary(text: &str) -> (String, String) {
     let mut summary = text.trim().to_string();
     let start = text.find("<think>");
     let end = text.find("</think>");
-    if let (Some(s), Some(e)) = (start, end) {
-        if e > s {
-            thinking = text[s + "<think>".len()..e].trim().to_string();
-            summary = (text[..s].to_string() + &text[e + "</think>".len()..])
-                .trim()
-                .to_string();
-        }
+    if let (Some(s), Some(e)) = (start, end)
+        && e > s
+    {
+        thinking = text[s + "<think>".len()..e].trim().to_string();
+        summary = (text[..s].to_string() + &text[e + "</think>".len()..])
+            .trim()
+            .to_string();
     }
     if thinking.is_empty() {
         // reasoning often appears as prose before the first timestamped line
         if let Some(idx) = summary
             .lines()
             .position(|l| l.trim_start().starts_with("[") && l.contains("]"))
+            && idx > 0
         {
-            if idx > 0 {
-                let all: Vec<&str> = summary.lines().collect();
-                thinking = all[..idx].join("\n").trim().to_string();
-                summary = all[idx..].join("\n").trim().to_string();
-            }
+            let all: Vec<&str> = summary.lines().collect();
+            thinking = all[..idx].join("\n").trim().to_string();
+            summary = all[idx..].join("\n").trim().to_string();
         }
     }
     (thinking, summary)
@@ -963,15 +1029,17 @@ fn download_from_url(
     if let Ok(rd) = std::fs::read_dir(dl_dir) {
         for entry in rd.flatten() {
             let p = entry.path();
-            if p.is_file() {
-                if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
-                    if matches!(
+            let is_media = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|ext| {
+                    matches!(
                         ext.to_lowercase().as_str(),
                         "mp4" | "mkv" | "webm" | "mov" | "avi" | "flv"
-                    ) {
-                        files.push(p);
-                    }
-                }
+                    )
+                });
+            if p.is_file() && is_media {
+                files.push(p);
             }
         }
     }
@@ -1036,10 +1104,11 @@ pub fn simplify_title_str(raw: &str) -> String {
         trimmed
     }
     .trim_end();
-    if let Some(open) = trimmed.rfind(" [") {
-        if trimmed.ends_with(']') && trimmed[open..].len() > 2 {
-            return trimmed[..open].trim_end().to_string();
-        }
+    if let Some(open) = trimmed.rfind(" [")
+        && trimmed.ends_with(']')
+        && trimmed[open..].len() > 2
+    {
+        return trimmed[..open].trim_end().to_string();
     }
     trimmed.to_string()
 }
@@ -1105,23 +1174,55 @@ const UTT_MIN_S: f64 = 1.5;
 /// Majority-vote smoothing window (seconds) for visual predictions (was SMOOTH_WINDOW in the old Python visual_server).
 const SMOOTH_WINDOW: usize = 15;
 
-/// ffmpeg args to extract 48 kHz mono PCM audio from `video` into `output`.
-fn ffmpeg_extract_args(video: &Path, output: &Path) -> Vec<String> {
-    vec![
+/// Build the ffmpeg noise-reduction audio filter chain from the config, e.g.
+/// `highpass=f=80,lowpass=f=14000,afftdn=nr=6:nf=-50`. `None` when noise
+/// reduction is disabled (plain 16 kHz decode).
+pub fn build_nr_filter(config: &AppConfig) -> Option<String> {
+    if !config.nr_enabled {
+        return None;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if config.highpass_hz > 0 {
+        parts.push(format!("highpass=f={}", config.highpass_hz));
+    }
+    if config.lowpass_hz > 0 {
+        parts.push(format!("lowpass=f={}", config.lowpass_hz));
+    }
+    parts.push(format!(
+        "afftdn=nr={}:nf={}",
+        config.afftdn_nr, config.afftdn_nf
+    ));
+    Some(parts.join(","))
+}
+
+/// ffmpeg args to decode the audio of `video` into a 16 kHz mono PCM WAV,
+/// optionally applying the noise-reduction filter chain, and reporting
+/// machine-readable progress on stdout (`-progress pipe:1`).
+fn ffmpeg_extract_args(video: &Path, output: &Path, nr_filter: Option<&str>) -> Vec<String> {
+    let mut args = vec![
         "-y".to_string(),
         "-i".to_string(),
         video.display().to_string(),
         "-vn".to_string(),
+    ];
+    if let Some(filter) = nr_filter {
+        args.push("-af".to_string());
+        args.push(filter.to_string());
+    }
+    args.extend([
         "-acodec".to_string(),
         "pcm_s16le".to_string(),
         "-ar".to_string(),
-        "48000".to_string(),
+        "16000".to_string(),
         "-ac".to_string(),
         "1".to_string(),
         output.display().to_string(),
         "-loglevel".to_string(),
         "error".to_string(),
-    ]
+        "-progress".to_string(),
+        "pipe:1".to_string(),
+    ]);
+    args
 }
 
 /// ffmpeg args to hardware-decode `video`, sample 1 fps, scale to `width`x`height` and write a single raw RGB24 blob to `output`.
@@ -1162,7 +1263,7 @@ fn read_model_image_size(model_dir: &Path) -> Result<(u32, u32), String> {
     Ok((h, w))
 }
 
-/// Run an ffmpeg subprocess with the given args, forwarding stderr to the UI. Registers the child PID so `stop_pipeline` can kill it; safe to call from multiple threads concurrently (the audio and visual threads each run their own ffmpeg).
+/// Run an ffmpeg subprocess with the given args, forwarding stderr to the UI. Registers the child PID so `stop_pipeline` can kill it; safe to call from multiple threads concurrently (the audio and visual threads each run their own ffmpeg). `on_progress` (when given) receives ffmpeg's `out_time` in microseconds from `-progress pipe:1` output — only pass it for commands that include that flag.
 fn run_ffmpeg(
     app: &AppHandle,
     pids: &Arc<Mutex<Vec<u32>>>,
@@ -1170,39 +1271,61 @@ fn run_ffmpeg(
     cancel: &Arc<AtomicBool>,
     item_id: &str,
     args: &[String],
+    on_progress: Option<&mut (dyn FnMut(u64) + Send)>,
 ) -> Result<(), String> {
     let mut cmd = Command::new("ffmpeg");
     cmd.args(args);
     hide_console(&mut cmd);
-    cmd.stdout(Stdio::null()).stderr(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    if on_progress.is_some() {
+        cmd.stdout(Stdio::piped());
+    } else {
+        cmd.stdout(Stdio::null());
+    }
     let mut child = cmd.spawn().map_err(|e| format!("spawn ffmpeg: {e}"))?;
     let stderr = child.stderr.take().expect("stderr piped");
+    let stdout = child.stdout.take();
     let pid = child.id();
     pids.lock().unwrap().push(pid);
 
-    let app2 = app.clone();
-    let id2 = item_id.to_string();
-    let log_file2 = log_file.clone();
-    let stderr_thread = std::thread::spawn(move || {
-        use std::io::BufRead;
-        let reader = std::io::BufReader::new(stderr);
-        for line in reader.lines() {
-            if let Ok(l) = line {
+    std::thread::scope(|s| -> Result<(), String> {
+        let app2 = app.clone();
+        let id2 = item_id.to_string();
+        let log_file2 = log_file.clone();
+        s.spawn(move || {
+            use std::io::BufRead;
+            let reader = std::io::BufReader::new(stderr);
+            for l in reader.lines().map_while(Result::ok) {
                 log_line(&app2, &log_file2, &id2, &l);
             }
+        });
+        if let (Some(out), Some(cb)) = (stdout, on_progress) {
+            s.spawn(move || {
+                use std::io::BufRead;
+                let reader = std::io::BufReader::new(out);
+                for line in reader.lines().map_while(Result::ok) {
+                    // `-progress pipe:1` emits key=value lines; both out_time
+                    // keys carry microseconds (out_time_ms is a misnomer).
+                    if let Some(us) = line
+                        .strip_prefix("out_time_ms=")
+                        .or_else(|| line.strip_prefix("out_time_us="))
+                        .and_then(|v| v.trim().parse::<u64>().ok())
+                    {
+                        cb(us);
+                    }
+                }
+            });
         }
-    });
-
-    let status = child.wait().map_err(|e| format!("wait ffmpeg: {e}"))?;
-    pids.lock().unwrap().retain(|p| *p != pid);
-    let _ = stderr_thread.join();
-    if cancel.load(Ordering::SeqCst) {
-        return Err("cancelled".to_string());
-    }
-    if !status.success() {
-        return Err(format!("ffmpeg failed (exit {:?})", status.code()));
-    }
-    Ok(())
+        let status = child.wait().map_err(|e| format!("wait ffmpeg: {e}"))?;
+        pids.lock().unwrap().retain(|p| *p != pid);
+        if cancel.load(Ordering::SeqCst) {
+            return Err("cancelled".to_string());
+        }
+        if !status.success() {
+            return Err(format!("ffmpeg failed (exit {:?})", status.code()));
+        }
+        Ok(())
+    })
 }
 
 fn sensevoice_regex() -> &'static regex::Regex {
@@ -1321,7 +1444,7 @@ fn format_asr(utterances: &[serde_json::Value]) -> String {
         out.push_str(&format!(
             "[{}-{}] [{}] [{}] {}\n",
             fmt_hms(start_ms / 1000),
-            fmt_hms((end_ms + 999) / 1000),
+            fmt_hms(end_ms.div_ceil(1000)),
             speaker,
             emotion,
             text,
@@ -1354,20 +1477,17 @@ fn offset_timestamps(content: &str, offset: u64) -> String {
         .lines()
         .map(|line| {
             let t = line.trim_start();
-            if let Some(rest) = t.strip_prefix('[') {
-                if let Some(end) = rest.find(']') {
-                    let inner = &rest[..end];
-                    if let Some((a, b)) = inner.split_once('-') {
-                        if let (Some(ta), Some(tb)) = (parse_hms(a.trim()), parse_hms(b.trim())) {
-                            return format!(
-                                "[{}-{}]{}",
-                                fmt_hms(ta + offset),
-                                fmt_hms(tb + offset),
-                                &rest[end + 1..]
-                            );
-                        }
-                    }
-                }
+            if let Some(rest) = t.strip_prefix('[')
+                && let Some(end) = rest.find(']')
+                && let Some((a, b)) = rest[..end].split_once('-')
+                && let (Some(ta), Some(tb)) = (parse_hms(a.trim()), parse_hms(b.trim()))
+            {
+                return format!(
+                    "[{}-{}]{}",
+                    fmt_hms(ta + offset),
+                    fmt_hms(tb + offset),
+                    &rest[end + 1..]
+                );
             }
             line.to_string()
         })
@@ -1470,25 +1590,30 @@ pub fn run_item(
         };
         runner.emit_log(&id, format!("[part {}] {}", idx + 1, video.display()));
 
-        // Stages 2+3 run concurrently: the audio thread extracts raw 48 kHz audio and runs denoise+ASR; the visual thread decodes and predicts in parallel, so the ffmpeg extract overlaps the visual work.
+        // Stages 2+3 run concurrently: the audio thread decodes the audio (with optional noise-reduction filters) and runs VAD+ASR; the visual thread decodes and predicts in parallel.
         runner.current_stage = 2;
         runner.emit_stage(&id, 2, 0);
         runner.emit_stage(&id, 3, 0);
-        let raw_wav = work_dir.join(format!("raw{part_tag}.wav"));
         let filtered_wav = work_dir.join(format!("filtered{part_tag}.wav"));
         let frames_raw = work_dir.join(format!("frames{part_tag}.raw"));
         let asr_part = work_dir.join(format!("asr{part_tag}.txt"));
         let visual_part = work_dir.join(format!("visual{part_tag}.txt"));
+        let nr_filter = build_nr_filter(config);
+        if let Some(f) = &nr_filter {
+            runner.emit_log(&id, format!("[audio] noise reduction: -af \"{f}\""));
+        } else {
+            runner.emit_log(&id, "[audio] noise reduction: disabled".to_string());
+        }
         runner.run_audio_visual(
             &id,
-            &raw_wav,
             &filtered_wav,
             video,
             &frames_raw,
             &asr_part,
             &visual_part,
+            nr_filter.as_deref(),
         )?;
-        runner.emit_log(&id, format!("Raw audio: {}", raw_wav.display()));
+        runner.emit_log(&id, format!("Filtered audio: {}", filtered_wav.display()));
         runner.emit_stage(&id, 2, 100);
         runner.emit_stage(&id, 3, 100);
 
@@ -1562,4 +1687,44 @@ pub fn run_item(
     let _ = std::fs::remove_dir_all(work_dir);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nr_filter_matches_expected_chain() {
+        let mut cfg = AppConfig::new();
+        assert_eq!(
+            build_nr_filter(&cfg).as_deref(),
+            Some("highpass=f=80,lowpass=f=14000,afftdn=nr=6:nf=-50")
+        );
+        cfg.nr_enabled = false;
+        assert_eq!(build_nr_filter(&cfg), None);
+    }
+
+    #[test]
+    fn nr_filter_skips_disabled_bandpass_parts() {
+        let mut cfg = AppConfig::new();
+        cfg.highpass_hz = 0;
+        cfg.lowpass_hz = 0;
+        cfg.afftdn_nr = 12.5;
+        cfg.afftdn_nf = -45;
+        assert_eq!(build_nr_filter(&cfg).as_deref(), Some("afftdn=nr=12.5:nf=-45"));
+    }
+
+    #[test]
+    fn normalize_clamps_nr_params() {
+        let mut cfg = AppConfig::new();
+        cfg.highpass_hz = 50000;
+        cfg.lowpass_hz = 1;
+        cfg.afftdn_nr = 200.0;
+        cfg.afftdn_nf = 0;
+        cfg.normalize();
+        assert_eq!(cfg.highpass_hz, 20000);
+        assert_eq!(cfg.lowpass_hz, 0, "lowpass below highpass is dropped");
+        assert_eq!(cfg.afftdn_nr, 97.0);
+        assert_eq!(cfg.afftdn_nf, -20);
+    }
 }

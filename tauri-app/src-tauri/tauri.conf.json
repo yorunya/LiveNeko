@@ -35,8 +35,8 @@
     ],
     "resources": {
       "../../prompt.md": "prompt.md",
-      "../../DeepFilterNet/models/DeepFilterNet3_onnx.tar.gz": "model/DeepFilterNet3_onnx.tar.gz",
-      "../scripts": "scripts"
+      "../scripts": "scripts",
+      "models/silero_vad.onnx": "model/silero_vad.onnx"
     }
   }
 }

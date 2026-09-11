@@ -4,8 +4,9 @@ Prints a JSON report of the Python environment: whether CUDA is available and
 whether the required Python libraries are importable. The interpreter version
 and ffmpeg presence are probed by the Rust backend directly, so they are not
 repeated here. The libraries needed for the local pipeline
-(audio_server.py/visual_server.py) are reported together; DeepFilterNet (df)
-powers the CUDA audio denoiser. The LLM summarization runs in-process via
+(audio_server.py/visual_server.py) are reported together; noise reduction and
+VAD run natively in Rust, so no denoiser/VAD libraries are needed here. The
+LLM summarization runs in-process via
 openai-rust2, so llama_cpp/openai are not required here. `huggingface_hub` and
 `modelscope` are only needed to download FunASR models and are reported
 separately.

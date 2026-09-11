@@ -382,10 +382,8 @@ fn walk_files(dir: &Path, name: &str, depth: usize, out: &mut Vec<PathBuf>) {
         let p = entry.path();
         match entry.file_type() {
             Ok(ft) if ft.is_dir() => subdirs.push(p),
-            Ok(ft) if ft.is_file() => {
-                if entry.file_name().to_string_lossy() == name {
-                    out.push(p);
-                }
+            Ok(ft) if ft.is_file() && entry.file_name().to_string_lossy() == name => {
+                out.push(p);
             }
             _ => {}
         }
@@ -473,7 +471,7 @@ fn aes_gcm_decrypt(key: &[u8], nonce: &[u8], mut data: Vec<u8>, tag: &[u8]) -> R
     let nonce = GenericArray::from_slice(nonce);
     let tag = GenericArray::from_slice(tag);
     cipher
-        .decrypt_in_place_detached(&nonce, b"", &mut data, &tag)
+        .decrypt_in_place_detached(nonce, b"", &mut data, tag)
         .map_err(|_| "failed to decrypt cookie (AES-GCM MAC check failed; possibly the key is wrong)".to_string())?;
     Ok(data)
 }

@@ -37,7 +37,7 @@ log = logging.getLogger(__name__)
 # contexts, the audio ASR activations and ffmpeg's NVDEC session. The batch
 # size is computed once from these constants — no runtime probing or retry.
 USABLE_VRAM = 6 * 1024 ** 3
-AUDIO_MODELS_VRAM = int((892.9 + 1.6 + 26.7) * 1024 ** 2)  # SenseVoiceSmall + fsmn-vad + cam++
+AUDIO_MODELS_VRAM = int((892.9 + 26.7) * 1024 ** 2)  # SenseVoiceSmall + cam++ (VAD is the native CPU Silero model in Rust)
 OTHER_VRAM_OVERHEAD = int(1.5 * 1024 ** 3)
 BYTES_PER_FRAME_AT_224 = int(5.5 * 1024 ** 2)  # measured ViT-base fp16 activations at 224x224
 BATCH_SIZE = 128  # cap; the computed size never exceeds this

@@ -1,6 +1,6 @@
 [package]
 name = "liveneko"
-version = "0.1.8"
+version = "0.1.10"
 description = "LiveNeko multi-modal video summarization desktop app"
 authors = ["LiveNeko"]
 edition = "2024"
@@ -20,11 +20,13 @@ serde_json = "1"
 tokio = { version = "1", features = ["rt", "time", "macros"] }
 uuid = { version = "1", features = ["v4"] }
 openai-rust2 = "1.7.6"
-encoding_rs = "0.8.35"
 regex = "1.13.1"
 ndarray = "0.16"
 url = "2.5"
-deep_filter = { path = "../../DeepFilterNet/libDF", features = ["tract", "wav-utils", "transforms"] }
+# Native Silero VAD (CPU) via ONNX Runtime — replaces the fsmn-vad Python model.
+ort = { version = "=2.0.0-rc.10", features = ["ndarray"] }
+# WAV reading for the native Silero VAD (ffmpeg's extraction output).
+hound = "3"
 # Browser cookie import (--cookies-from-browser equivalent): sqlite stores,
 # AES-GCM for Chromium v10 cookies, SHA-1 for YouTube SAPISIDHASH auth.
 rusqlite = { version = "0.32", features = ["bundled"] }

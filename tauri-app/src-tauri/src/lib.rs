@@ -2,11 +2,11 @@ mod assets;
 mod commands;
 mod config;
 mod cookies;
-mod df_denoise;
 mod downloader;
 mod model_ipc;
 mod os_theme;
 mod pipeline;
+mod silero_vad;
 
 use std::path::PathBuf;
 use tauri::Manager;

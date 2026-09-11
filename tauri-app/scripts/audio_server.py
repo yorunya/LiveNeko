@@ -1,20 +1,23 @@
 """Resident IPC audio worker for the LiveNeko Tauri app.
 
 Launched once by the Rust backend at the start of a pipeline run. Loads the
-configured VAD/ASR/SPK models a single time, then stays alive reading JSON
-requests on stdin and writing JSON responses on stdout until told to shut down.
-Models are NOT reloaded between requests.
+configured ASR/SPK models a single time, then stays alive reading JSON
+requests on stdin and writing JSON responses on stdout until told to shut
+down. Models are NOT reloaded between requests.
 
-FunASR models are user-provided (local directories or downloaded from Hugging
-Face / ModelScope by the app); none are bundled. The worker is configured with
-a JSON file written by the Rust backend:
+VAD is NOT done here: the Rust backend runs the bundled native Silero VAD
+(tauri-app/src-tauri/src/silero_vad.rs, CPU ONNX) on the denoised audio and
+sends the utterance segments with every request. FunASR ASR/SPK models are
+user-provided (local directories or downloaded from Hugging Face / ModelScope
+by the app); none are bundled. The worker is configured with a JSON file
+written by the Rust backend:
 
   {
     "asr": {"backend": "local", "type": "sensevoice-small",
             "dir": "<asr model dir>", "language": "zh"},
-    "vad": {"dir": "<fsmn-vad dir>"},
     "spk": {"dir": "<cam++ dir>"} | null,
-    "ref": {"dir": "<reference wav dir>", "name": "taffy"} | null
+    "ref": {"file": "<reference wav>", "name": "taffy",
+            "segments": [[start_ms, end_ms], ...]} | null
   }
 
   For the online ASR backend the `asr` object is:
@@ -27,12 +30,13 @@ ASR types:
   - paraformer-zh-streaming Streaming Paraformer (used chunk-by-chunk)
   - qwen3-api               Qwen3-ASR over an OpenAI-compatible endpoint
 
-The `process` command expects an already-denoised 16 kHz mono WAV. DeepFilterNet
-noise suppression runs in-process in Rust (tauri-app/src-tauri/src/df_denoise.rs)
-using the ONNX `df` crate, so this worker only performs VAD/ASR/SPK.
+The `process` command expects a 16 kHz mono WAV (decoded by ffmpeg, with the
+optional noise-reduction filters configured in Settings) plus the Silero VAD
+segments. This worker only performs ASR/SPK.
 
 Protocol (newline-delimited JSON on stdin/stdout):
-  Request:  {"cmd":"process","id":"<id>","input":"<filtered 16khz.wav>"}
+  Request:  {"cmd":"process","id":"<id>","input":"<filtered 16khz.wav>",
+             "segments":[[start_ms,end_ms], ...]}
   Response: {"cmd":"process","id":"<id>","ok":true,
              "utterances":[[start_ms,end_ms,"<speaker>"|"other","<raw tagged text>"], ...]}
             {"cmd":"process","id":"<id>","ok":false,"error":"..."}
@@ -46,7 +50,6 @@ labelled "other".
 import argparse
 import concurrent.futures
 import contextlib
-import glob
 import io
 import json
 import logging
@@ -246,27 +249,7 @@ def build_asr(config, device):
     )
 
 
-# ---- VAD / SPK ----
-
-def load_vad(vad_dir, device):
-    if not vad_dir or not os.path.isdir(vad_dir):
-        raise RuntimeError(f"VAD model directory not found: {vad_dir}")
-    log.info(f"Loading VAD model from {vad_dir}")
-    return AutoModel(
-        model=vad_dir,
-        device=device,
-        disable_update=True,
-        disable_pbar=True,
-        trust_remote_code=False,
-    )
-
-
-def detect_segments(speech, vad):
-    """Run the FSMN-VAD model and return its [[start_ms, end_ms], ...] segments."""
-    return vad.inference(
-        input=speech, model=vad.model, kwargs=vad.kwargs, fs=SAMPLE_RATE
-    )[0]["value"]
-
+# ---- SPK ----
 
 def load_spk(spk_dir, device):
     if not spk_dir or not os.path.isdir(spk_dir):
@@ -293,11 +276,12 @@ def speaker_embeddings(chunks, spk):
     return embeddings
 
 
-def build_reference(wav_path, vad, spk):
+def build_reference(wav_path, segments, spk):
+    """Build one reference voiceprint from the wav's pre-computed VAD segments
+    (delivered by the Rust backend, which runs the native Silero VAD)."""
     speech, sr = sf.read(wav_path, dtype="float32")
     if sr != SAMPLE_RATE:
         raise RuntimeError(f"Unexpected sample rate {sr} for {wav_path}; expected {SAMPLE_RATE}")
-    segments = detect_segments(speech, vad)
     chunks = []
     step = SPK_CHUNK_SAMPLES
     for start_ms, end_ms in segments:
@@ -319,8 +303,7 @@ def _speaker_embeddings_matrix(chunks, long_idx, spk):
 
 # ---- transcription pipeline ----
 
-def transcribe_samples(speech, segments, asr, vad, spk, ref_matrix, speaker_name, on_progress=None):
-    log.info(f"VAD: {len(segments)} utterances")
+def transcribe_samples(speech, segments, asr, spk, ref_matrix, speaker_name, on_progress=None):
     utterances = []
     total = max(len(segments), 1)
 
@@ -371,7 +354,27 @@ def transcribe_samples(speech, segments, asr, vad, spk, ref_matrix, speaker_name
     return utterances
 
 
-def process(req, asr, vad, spk, ref_matrix, speaker_name):
+def parse_segments(raw):
+    """Validate the Rust-provided VAD segments: a list of [start_ms, end_ms]
+    integer pairs with 0 <= start < end."""
+    if not isinstance(raw, list):
+        raise RuntimeError("request is missing the VAD segments list")
+    segments = []
+    for item in raw:
+        if (
+            not isinstance(item, (list, tuple))
+            or len(item) != 2
+            or not all(isinstance(v, int) for v in item)
+        ):
+            raise RuntimeError(f"malformed VAD segment: {item!r}")
+        start_ms, end_ms = item
+        if start_ms < 0 or end_ms <= start_ms:
+            raise RuntimeError(f"malformed VAD segment: {item!r}")
+        segments.append((start_ms, end_ms))
+    return segments
+
+
+def process(req, asr, spk, ref_matrix, speaker_name):
     rid = req.get("id", "")
     input_wav = req.get("input", "")
     if not input_wav:
@@ -381,15 +384,15 @@ def process(req, asr, vad, spk, ref_matrix, speaker_name):
         def progress(n):
             send({"progress": int(n)})
 
-        # VAD on the 16 kHz filtered audio.
         speech, sr = sf.read(input_wav, dtype="float32")
         if sr != SAMPLE_RATE:
             raise RuntimeError(f"Unexpected sample rate {sr} for {input_wav}; expected {SAMPLE_RATE}")
-        segments = detect_segments(speech, vad)
+        segments = parse_segments(req.get("segments"))
         # ASR + speaker labelling: report 20..100 so the Rust backend keeps the
-        # 0..20 range for DeepFilterNet denoising.
+        # 0..20 range for DeepFilterNet denoising (VAD runs in Rust between the
+        # two and needs no progress range of its own).
         utterances = transcribe_samples(
-            speech, segments, asr, vad, spk, ref_matrix, speaker_name,
+            speech, segments, asr, spk, ref_matrix, speaker_name,
             on_progress=lambda p: progress(20 + p * 0.8),
         )
         send({"cmd": "process", "id": rid, "ok": True, "utterances": utterances})
@@ -424,30 +427,28 @@ def main():
 
     spk = None
     ref_matrix = None
-    ref_paths = []
+    speaker_name = ""
     try:
         with quiet_stdout():
-            vad = load_vad((config.get("vad") or {}).get("dir", ""), device)
             asr = build_asr(config, device)
             spk_cfg = config.get("spk") or {}
             if spk_cfg.get("dir"):
                 spk = load_spk(spk_cfg["dir"], device)
             ref_cfg = config.get("ref") or {}
-            ref_dir = ref_cfg.get("dir", "")
-            if spk is not None and ref_dir:
-                ref_paths = sorted(glob.glob(os.path.join(ref_dir, "*.wav")))
-                if ref_paths:
-                    ref_matrix = np.stack([build_reference(p, vad, spk) for p in ref_paths])
+            ref_file = ref_cfg.get("file", "")
+            if spk is not None and ref_file:
+                speaker_name = ref_cfg.get("name", "speaker")
+                segments = parse_segments(ref_cfg.get("segments"))
+                ref_matrix = build_reference(ref_file, segments, spk)[None, :]
     except Exception as e:
         log.exception("model load failed")
         send({"cmd": "ready", "ok": False, "error": str(e)})
         return
 
-    speaker_name = (config.get("ref") or {}).get("name", "speaker")
     if spk is None:
         log.info("No SPK model configured: speaker identification is disabled")
     elif ref_matrix is not None:
-        log.info(f"Reference voiceprints: {len(ref_paths)} file(s), speaker '{speaker_name}'")
+        log.info(f"Reference voiceprint for speaker '{speaker_name}'")
     else:
         log.info("No speaker reference: utterances will not be tagged with a specific speaker")
 
@@ -473,7 +474,7 @@ def main():
             log.info("shutdown")
             break
         elif cmd == "process":
-            process(req, asr, vad, spk, ref_matrix, speaker_name)
+            process(req, asr, spk, ref_matrix, speaker_name)
         else:
             send({"cmd": cmd, "id": req.get("id", ""), "ok": False,
                   "error": f"unknown cmd {cmd}"})

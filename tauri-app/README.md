@@ -18,7 +18,7 @@ settings.
   from inside the app; an existing local model directory works without them.
 
 ## FunASR models (user-provided, NOT bundled)
-The app no longer bundles ASR/VAD/SPK weights. On first launch (and in
+The app no longer bundles ASR/SPK weights. On first launch (and in
 Settings) you configure:
 
 - **ASR (required)** — one of:
@@ -33,7 +33,9 @@ Settings) you configure:
     the app derives the native URL from the base URL and automatically picks
     the request shape that works for the chosen model (e.g.
     `qwen-audio-3.0-asr-flash` / `fun-asr-flash-*` are native-only).
-- **VAD (required)** — an `fsmn-vad` compatible model directory.
+- **VAD** — built in: the app bundles the ~2.3 MB `silero_vad.onnx` and runs
+  it natively in Rust (CPU, ONNX Runtime via the `ort` crate). No download or
+  configuration needed.
 - **SPK (optional)** — a `cam++` compatible model directory. Without it,
   speaker identification is disabled and every utterance is labelled `other`.
 
@@ -41,16 +43,26 @@ Each model can be:
 - an existing local directory (validated for the expected files/config and
   model type), or
 - downloaded from **Hugging Face** or **ModelScope** into
-  `<app_data>/funasr-models/<asr|vad|spk>` (or a directory you pick).
+  `<app_data>/funasr-models/<asr|spk>` (or a directory you pick).
 
-ASR/VAD model paths (and the Qwen3-ASR endpoint fields) are validated before a
+ASR model paths (and the Qwen3-ASR endpoint fields) are validated before a
 run starts; the Qwen3-ASR connection can be probed with *Test connection*.
+
+### VAD behavior: Silero vs the previous fsmn-vad
+Silero (300 ms min-silence, 250 ms min-speech, 30 ms padding, 60 s max
+segment) was measured against fsmn-vad on a 3-minute denoised stream
+recording: both produced 15 segments of similar length. fsmn-vad additionally
+fired on very low-level residual audio (post-denoise RMS ≈ 0.002), which ASR
+transcribed as junk `。` lines — Silero rejects that residue, so transcripts
+are cleaner; the trade-off is that faint far-field speech (≈20× quieter than
+normal) can be missed. fsmn-vad timestamps are quantized to 10 ms frames,
+Silero's to 32 ms windows; both are reported as integer milliseconds, so the
+transcript format is unchanged.
 
 ## Bundled (in the installer)
 - `yt-dlp`-style downloading is implemented in Rust (no exe bundled).
-- The DeepFilterNet3 ONNX model (`model/DeepFilterNet3_onnx.tar.gz` for
-  in-process Rust denoising), `prompt.md`, and the Python worker scripts
-  (`scripts/`).
+- The Silero VAD ONNX model (`model/silero_vad.onnx`, native CPU VAD),
+  `prompt.md`, and the Python worker scripts (`scripts/`).
 
 ## How to run (dev)
 ```bash
@@ -71,9 +83,9 @@ root `AGENTS.md` (`cargo xwin` shim + `--target x86_64-pc-windows-msvc`).
 ## First launch
 1. The app runs an environment + asset check once; the result is cached in
    `env_report.json` (`env_checked` in config) so later launches skip it.
-2. **Configure the FunASR models** — choose an ASR type (or the Qwen3-ASR API),
-   a local directory or a Hugging Face / ModelScope download, and the required
-   `fsmn-vad` VAD model. The SPK (`cam++`) model is optional.
+2. **Configure the ASR model** — choose an ASR type (or the Qwen3-ASR API)
+   and a local directory or a Hugging Face / ModelScope download. VAD needs no
+   setup (bundled native Silero). The SPK (`cam++`) model is optional.
 3. If no VideoNeko model directory is set, the wizard asks you to pick one
    (the directory holding your fine-tuned `config.json` + `model.safetensors`
    + `preprocessor_config.json`).
@@ -84,20 +96,25 @@ root `AGENTS.md` (`cargo xwin` shim + `--target x86_64-pc-windows-msvc`).
 ## Pipeline
 Each queued video runs through the 4 stages with progress and logs. At the start
 of a run the app launches **resident model servers** (`audio_server.py` +
-`visual_server.py`) over stdin/stdout IPC — the VAD/ASR/SPK and VideoNeko
-models load **once** and are reused for every queued video (no per-video
-reload). The Rust backend writes the configured model paths / ASR backend to
-`work/audio_server.json` and passes it to `audio_server.py --config`.
+`visual_server.py`) over stdin/stdout IPC — the ASR/SPK and VideoNeko models
+load **once** and are reused for every queued video (no per-video reload);
+VAD runs natively in Rust (bundled Silero ONNX, CPU) after the denoise stage
+and the utterance segments are passed to the audio worker. The Rust backend
+writes the configured model paths / ASR backend to `work/audio_server.json`
+and passes it to `audio_server.py --config`.
 
 1. `1/4 Video Input` — for a Bilibili URL, the app first probes how many videos
    the URL yields. A multi-part URL is downloaded fully (`--yes-playlist`, parts
    ordered `001_…`, `002_…`) but the parts are **not** merged with ffmpeg (that
    was slow). Local files are used as-is. The download resolution is set in
    Settings (360P / 480P / 720P / 1080P, default 720P).
-2. `2/4 ASR` — ffmpeg extracts 48 kHz mono; Rust denoises it in-process with
-   DeepFilterNet (ONNX via the `df` crate), downsamples to 16 kHz, then the
-   resident `audio_server.py` runs the configured ASR (local FunASR model or
-   Qwen3-ASR API) plus optional speaker labelling and returns `asr.txt`.
+2. `2/4 ASR` — ffmpeg decodes the audio to 16 kHz mono, optionally applying
+   the noise-reduction filters configured in Settings (band-pass + `afftdn`,
+   e.g. `highpass=f=80,lowpass=f=14000,afftdn=nr=6:nf=-50`; enabled by
+   default, and reported in the run log as `-af "…"`); Rust then runs the
+   native Silero VAD (CPU) and the resident `audio_server.py` runs the
+   configured ASR (local FunASR model or Qwen3-ASR API) plus optional speaker
+   labelling and returns `asr.txt`.
 3. `3/4 Visual` — ffmpeg (hardware-accelerated) decodes 1 fps frames; the
    visual server (VideoNeko, resident) classifies them and returns `visual.txt`.
    Stages 2 and 3 run **in parallel** per part. Multi-part inputs are analysed

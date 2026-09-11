@@ -1,12 +1,13 @@
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager};
 
-/// Resolved locations of all bundled assets. During development these fall back to the repo root; in production they resolve from the resource directory. FunASR models (ASR/VAD/SPK) are NOT bundled — the user provides them (see `AppConfig`).
+/// Resolved locations of all bundled assets. During development these fall back to the repo tree; in production they resolve from the resource directory. FunASR ASR/SPK models are NOT bundled — the user provides them (see `AppConfig`); the Silero VAD ONNX IS bundled.
 #[derive(Clone, Debug)]
 pub struct Assets {
     pub prompt_md: PathBuf,
     pub scripts_dir: PathBuf,
-    pub filter_model_tar: PathBuf,
+    /// Bundled Silero VAD ONNX model (see `crate::silero_vad`).
+    pub silero_model: PathBuf,
 }
 
 impl Assets {
@@ -40,12 +41,13 @@ impl Assets {
             res
         };
 
-        // The ONNX DeepFilterNet model is bundled as model/DeepFilterNet3_onnx.tar.gz
-        let filter_model_tar = {
+        // The Silero VAD ONNX ships inside the app bundle (src-tauri/models/ in
+        // the repo tree, model/ in the resource dir).
+        let silero_model = {
+            let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
             let candidates = [
-                resource.join("model/DeepFilterNet3_onnx.tar.gz"),
-                repo_root.join("model/DeepFilterNet3_onnx.tar.gz"),
-                repo_root.join("DeepFilterNet/models/DeepFilterNet3_onnx.tar.gz"),
+                resource.join("model/silero_vad.onnx"),
+                PathBuf::from(manifest_dir).join("models/silero_vad.onnx"),
             ];
             candidates
                 .iter()
@@ -57,16 +59,12 @@ impl Assets {
         Self {
             prompt_md: pick("prompt.md"),
             scripts_dir: pick("scripts"),
-            filter_model_tar,
+            silero_model,
         }
     }
 
     /// Path to the Python model helper used for validation and downloads.
     pub fn model_tools_script(&self) -> PathBuf {
         self.scripts_dir.join("model_tools.py")
-    }
-
-    pub fn filter_model_present(&self) -> bool {
-        self.filter_model_tar.exists()
     }
 }

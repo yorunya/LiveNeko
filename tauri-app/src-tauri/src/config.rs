@@ -12,6 +12,17 @@ pub struct AppConfig {
     pub custom_prompt: String,
     /// Download quality for yt-dlp: 360 | 480 | 720 | 1080 (default 720).
     pub download_quality: u32,
+    /// Noise reduction applied during audio extraction via ffmpeg filters
+    /// (`highpass`, `lowpass`, `afftdn`). Off ⇒ plain 16 kHz decode.
+    pub nr_enabled: bool,
+    /// Highpass corner frequency in Hz (0 = no highpass).
+    pub highpass_hz: u32,
+    /// Lowpass corner frequency in Hz (0 = no lowpass).
+    pub lowpass_hz: u32,
+    /// afftdn noise reduction amount in dB (ffmpeg range 0.01..97).
+    pub afftdn_nr: f32,
+    /// afftdn noise floor in dB (ffmpeg range -80..-20).
+    pub afftdn_nf: i32,
     /// Optional browser cookie import for downloads (yt-dlp
     /// --cookies-from-browser equivalent): "" | "firefox" | "chrome" | "edge".
     pub cookie_browser: String,
@@ -37,10 +48,6 @@ pub struct AppConfig {
     pub asr_model_dir: String,
     /// Optional ASR language hint ("" = model default; en/zh/auto/...).
     pub asr_language: String,
-    /// VAD model source: "local" | "huggingface" | "modelscope" (fsmn-vad compatible).
-    pub vad_source: String,
-    pub vad_model_id: String,
-    pub vad_model_dir: String,
     /// SPK model is optional: when disabled (or missing) speaker identification
     /// is disabled and every utterance is labelled "other".
     pub spk_enabled: bool,
@@ -98,13 +105,6 @@ pub fn default_model_id(kind: &str, source: &str) -> String {
                 "iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online"
             }
         }
-        "fsmn-vad" => {
-            if hf {
-                "funasr/fsmn-vad"
-            } else {
-                "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"
-            }
-        }
         "cam++" => {
             if hf { "funasr/campplus" } else { "iic/speech_campplus_sv_zh-cn_16k-common" }
         }
@@ -124,6 +124,13 @@ impl AppConfig {
             engine: "api".to_string(),
             custom_prompt: String::new(),
             download_quality: 720,
+            // Noise reduction defaults to on with a mild band-pass + afftdn —
+            // the previous DeepFilterNet denoiser was always-on as well.
+            nr_enabled: true,
+            highpass_hz: 80,
+            lowpass_hz: 14000,
+            afftdn_nr: 6.0,
+            afftdn_nf: -50,
             cookie_browser: String::new(),
             env_checked: false,
             speaker_name: String::new(),
@@ -135,9 +142,6 @@ impl AppConfig {
             asr_model_id: default_model_id("sensevoice-small", "huggingface"),
             asr_model_dir: String::new(),
             asr_language: String::new(),
-            vad_source: "huggingface".to_string(),
-            vad_model_id: default_model_id("fsmn-vad", "huggingface"),
-            vad_model_dir: String::new(),
             spk_enabled: false,
             spk_source: "huggingface".to_string(),
             spk_model_id: default_model_id("cam++", "huggingface"),
@@ -172,14 +176,14 @@ impl AppConfig {
     }
 
     /// True when the required FunASR fields are configured (no filesystem or
-    /// network validation — see `validate_model_config` for that).
+    /// network validation — see `validate_model_config` for that). VAD is the
+    /// bundled native Silero model and needs no configuration.
     pub fn funasr_configured(&self) -> bool {
-        let asr_ok = if self.asr_is_api() {
+        if self.asr_is_api() {
             !self.qwen3_base_url.trim().is_empty() && !self.qwen3_model.trim().is_empty()
         } else {
             !self.asr_model_dir.trim().is_empty()
-        };
-        asr_ok && !self.vad_model_dir.trim().is_empty()
+        }
     }
 
     /// Normalize/migrate field values so they always hold valid defaults
@@ -209,6 +213,21 @@ impl AppConfig {
         if !matches!(self.download_quality, 360 | 480 | 720 | 1080) {
             self.download_quality = 720;
         }
+        // Noise reduction: clamp to ffmpeg-legal ranges. highpass/lowpass 0
+        // disables that filter; a lowpass below the highpass would only mute
+        // the audio, so drop the lowpass in that case.
+        self.highpass_hz = self.highpass_hz.clamp(0, 20000);
+        self.lowpass_hz = self.lowpass_hz.clamp(0, 96000);
+        if !self.afftdn_nr.is_finite() || self.afftdn_nr < 0.01 {
+            self.afftdn_nr = 0.01;
+        }
+        if self.afftdn_nr > 97.0 {
+            self.afftdn_nr = 97.0;
+        }
+        self.afftdn_nf = self.afftdn_nf.clamp(-80, -20);
+        if self.lowpass_hz > 0 && self.highpass_hz > 0 && self.lowpass_hz <= self.highpass_hz {
+            self.lowpass_hz = 0;
+        }
         if !matches!(self.cookie_browser.as_str(), "" | "firefox" | "chrome" | "edge") {
             self.cookie_browser.clear();
         }
@@ -226,23 +245,16 @@ impl AppConfig {
         if !valid_source(&self.asr_source) {
             self.asr_source = "huggingface".to_string();
         }
-        if !valid_source(&self.vad_source) {
-            self.vad_source = "huggingface".to_string();
-        }
         if !valid_source(&self.spk_source) {
             self.spk_source = "huggingface".to_string();
         }
         if self.asr_model_id.trim().is_empty() {
             self.asr_model_id = default_model_id(&self.asr_type, &self.asr_source);
         }
-        if self.vad_model_id.trim().is_empty() {
-            self.vad_model_id = default_model_id("fsmn-vad", &self.vad_source);
-        }
         if self.spk_model_id.trim().is_empty() {
             self.spk_model_id = default_model_id("cam++", &self.spk_source);
         }
         self.asr_model_dir = self.asr_model_dir.trim().to_string();
-        self.vad_model_dir = self.vad_model_dir.trim().to_string();
         self.spk_model_dir = self.spk_model_dir.trim().to_string();
         self.asr_language = self.asr_language.trim().to_string();
         self.funasr_models_dir = self.funasr_models_dir.trim().to_string();

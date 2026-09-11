@@ -98,7 +98,7 @@
 
           <div class="card">
             <h2 data-i18n="settings.funasrTitle">FunASR audio models</h2>
-            <p class="hint" data-i18n="settings.funasrHint">FunASR models are not bundled with the app. Pick a local model directory, or download one from Hugging Face / ModelScope and validate it. ASR and VAD models are required; the SPK model is optional.</p>
+            <p class="hint" data-i18n="settings.funasrHint">ASR models are not bundled with the app. Pick a local model directory, or download one from Hugging Face / ModelScope and validate it. VAD runs natively on CPU with the bundled Silero model (no download needed); the SPK model is optional.</p>
 
             <h3 data-i18n="settings.asrTitle">ASR model</h3>
             <div class="row">
@@ -141,29 +141,6 @@
               <div class="row"><button id="btn-test-asr-api" class="btn small" data-i18n="settings.testConnection">Test connection</button><span id="asr-api-status" class="hint"></span></div>
             </div>
 
-            <h3 data-i18n="settings.vadTitle">VAD model (fsmn-vad)</h3>
-            <div class="sub-card">
-              <div class="row">
-                <label class="wide"><span data-i18n="settings.modelSource">Source</span>
-                  <select id="cfg-vad-source">
-                    <option value="local" data-i18n="settings.sourceLocal">Local directory</option>
-                    <option value="huggingface">Hugging Face</option>
-                    <option value="modelscope">ModelScope</option>
-                  </select>
-                </label>
-              </div>
-              <div class="row" id="vad-download-row">
-                <input id="cfg-vad-id" type="text" data-i18n-placeholder="settings.modelIdPlaceholder" placeholder="Repo id (e.g. funasr/fsmn-vad)" />
-                <button id="btn-download-vad" class="btn" data-i18n="settings.download">Download</button>
-              </div>
-              <div class="row">
-                <input id="cfg-vad-dir" type="text" data-i18n-placeholder="settings.vadDirPlaceholder" placeholder="Path to the fsmn-vad model directory" />
-                <button id="btn-browse-vad" class="btn" data-i18n="settings.browse">Browse…</button>
-                <button id="btn-validate-vad" class="btn ghost small" data-i18n="settings.validate">Validate</button>
-                <span id="vad-status" class="hint"></span>
-              </div>
-            </div>
-
             <h3 data-i18n="settings.spkModelTitle">SPK model (cam++, optional)</h3>
             <div class="row"><label class="inline"><input type="checkbox" id="cfg-spk-model-enabled" /> <span data-i18n="settings.spkModelEnable">Use a SPK model for speaker identification</span></label></div>
             <div id="spk-model-settings" class="sub-card hidden">
@@ -185,6 +162,24 @@
                 <button id="btn-browse-spk" class="btn" data-i18n="settings.browse">Browse…</button>
                 <button id="btn-validate-spk" class="btn ghost small" data-i18n="settings.validate">Validate</button>
                 <span id="spk-status" class="hint"></span>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <h2 data-i18n="settings.nrTitle">Noise reduction</h2>
+            <p class="hint" data-i18n="settings.nrHint">Audio filters applied while extracting audio with ffmpeg (band-pass plus the afftdn denoiser). Disable to analyze the raw audio. Example chain: highpass=f=80,lowpass=f=14000,afftdn=nr=6:nf=-50.</p>
+            <div class="row">
+              <label class="inline"><input type="checkbox" id="cfg-nr-enabled" /> <span data-i18n="settings.nrEnable">Enable noise reduction</span></label>
+            </div>
+            <div id="nr-settings" class="sub-card hidden">
+              <div class="row">
+                <label class="wide"><span data-i18n="settings.nrHighpass">Highpass (Hz, 0 = off)</span> <input id="cfg-nr-highpass" type="number" min="0" max="20000" step="1" /></label>
+                <label class="wide"><span data-i18n="settings.nrLowpass">Lowpass (Hz, 0 = off)</span> <input id="cfg-nr-lowpass" type="number" min="0" max="96000" step="1" /></label>
+              </div>
+              <div class="row">
+                <label class="wide"><span data-i18n="settings.nrNr">afftdn nr — noise reduction (dB)</span> <input id="cfg-nr-nr" type="number" min="0.01" max="97" step="0.1" /></label>
+                <label class="wide"><span data-i18n="settings.nrNf">afftdn nf — noise floor (dB)</span> <input id="cfg-nr-nf" type="number" min="-80" max="-20" step="1" /></label>
               </div>
             </div>
           </div>
@@ -314,7 +309,7 @@
               <span class="step-num">1</span>
               <div class="step-body">
                 <strong data-i18n="setup.stepFunasr">Configure FunASR audio models</strong>
-                <p class="hint" data-i18n="setup.stepFunasrHint">ASR and VAD models are not bundled. Choose a model type and download it from Hugging Face / ModelScope, or pick an existing local directory.</p>
+                <p class="hint" data-i18n="setup.stepFunasrHint">ASR models are not bundled. Choose a model type and download it from Hugging Face / ModelScope, or pick an existing local directory. VAD needs no setup (bundled native Silero).</p>
                 <div class="row">
                   <label class="wide"><span data-i18n="settings.modelType">Model type</span>
                     <select id="setup-asr-type">
@@ -348,11 +343,6 @@
                 <div class="row" id="setup-asr-dir-row">
                   <input id="setup-asr-dir" type="text" data-i18n-placeholder="settings.asrDirPlaceholder" placeholder="Path to the ASR model directory" />
                   <button id="setup-browse-asr" class="btn" data-i18n="settings.browse">Browse…</button>
-                </div>
-                <div class="row" id="setup-vad-row">
-                  <input id="setup-vad-dir" type="text" data-i18n-placeholder="settings.vadDirPlaceholder" placeholder="Path to the fsmn-vad model directory" />
-                  <button id="setup-browse-vad" class="btn" data-i18n="settings.browse">Browse…</button>
-                  <button id="setup-download-vad" class="btn ghost small" data-i18n="setup.downloadVad">Download fsmn-vad</button>
                 </div>
                 <span id="setup-funasr-status" class="hint"></span>
               </div>

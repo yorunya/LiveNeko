@@ -53,7 +53,6 @@ TYPE_HINTS = {
     "sensevoice-small": ("sensevoice", "sense_voice"),
     "fun-asr-nano": ("funasrnano", "fun_asr_nano", "fun-asr-nano", "qwen3"),
     "paraformer-zh-streaming": ("paraformerstreaming", "paraformer_streaming"),
-    "fsmn-vad": ("fsmnvad", "fsmn_vad", "fsmn-vad"),
     "cam++": ("campplus", "cam++", "cam_plus"),
 }
 
@@ -155,9 +154,6 @@ def check_dir(kind, model_type, directory):
     elif model_type == "paraformer-zh-streaming":
         if "model.pt" not in file_names and not weights:
             out["errors"].append("Paraformer checkpoint weight file is missing")
-    elif model_type == "fsmn-vad":
-        if "model.pt" not in file_names:
-            out["warnings"].append("fsmn-vad usually ships a model.pt weight file")
     elif model_type == "cam++":
         if not any("campplus" in os.path.basename(w).lower() for w in weights):
             out["warnings"].append(
@@ -174,7 +170,7 @@ def check_batch(config_path):
     items = {}
     errors = []
     warnings = []
-    for slot in ("asr", "vad", "spk"):
+    for slot in ("asr", "spk"):
         spec = checks.get(slot)
         if spec is None or not spec.get("enabled", False):
             items[slot] = {"ok": True, "skipped": True, "errors": [], "warnings": []}

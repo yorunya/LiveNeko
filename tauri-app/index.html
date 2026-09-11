@@ -80,7 +80,6 @@
         <section id="tab-settings" class="view">
           <div class="card">
             <h2 data-i18n="settings.languageTitle">Language</h2>
-            <p class="hint" data-i18n="settings.languageHint">Interface language. Default follows your system language.</p>
             <div class="row">
               <select id="cfg-language" style="flex:0 1 240px;">
                 <option value="" data-i18n="settings.languageSystem">System default</option>
@@ -98,7 +97,6 @@
 
           <div class="card">
             <h2 data-i18n="settings.funasrTitle">FunASR audio models</h2>
-            <p class="hint" data-i18n="settings.funasrHint">ASR models are not bundled with the app. Pick a local model directory, or download one from Hugging Face / ModelScope and validate it. VAD runs natively on CPU with the bundled Silero model (no download needed); the SPK model is optional.</p>
 
             <h3 data-i18n="settings.asrTitle">ASR model</h3>
             <div class="row">
@@ -195,7 +193,6 @@
 
           <div class="card">
             <h2 data-i18n="settings.speakerTitle">Speaker identification</h2>
-            <p class="hint" data-i18n="settings.speakerHint">Optionally tag transcript lines with a specific speaker. Choose a short reference WAV clip of that speaker's voice (a few seconds of clean speech); it is converted to 16 kHz automatically if needed.</p>
             <div class="row">
               <label class="inline"><input type="checkbox" id="cfg-spk-enabled" /> <span data-i18n="settings.speakerEnable">Identify a specific speaker</span></label>
             </div>
@@ -210,7 +207,6 @@
 
           <div class="card">
             <h2 data-i18n="settings.qualityTitle">Video download quality</h2>
-            <p class="hint" data-i18n="settings.qualityHint">Resolution used when downloading a video from a Bilibili URL (360P / 480P / 720P / 1080P). Lower is faster and smaller; default is 720P.</p>
             <div class="row">
               <label><input type="radio" name="quality" value="360" /> 360P</label>
               <label><input type="radio" name="quality" value="480" /> 480P</label>
@@ -236,7 +232,6 @@
 
           <div class="card">
             <h2 data-i18n="settings.engineTitle">Summarization Engine</h2>
-            <p class="hint" data-i18n="settings.engineHint">Choose where the summary LLM runs: a hosted OpenAI-compatible API, a local Ollama server, or a llama.cpp server.</p>
             <div class="row">
               <label><input type="radio" name="engine" value="api" /> <span data-i18n="settings.engineApi">OpenAI-compatible API</span></label>
               <label><input type="radio" name="engine" value="ollama" /> <span data-i18n="settings.engineOllama">Ollama</span></label>

@@ -2,43 +2,69 @@
 
 [English](README.md) | [简体中文](README-zh.md)
 
-LiveNeko is a desktop application that automatically summarizes
+LiveNeko is a Windows desktop application that automatically summarizes
 livestream VODs (e.g. Bilibili) by combining **speech recognition**, **visual
-scene detection**, and an **LLM summary engine**. 
+scene detection**, and an **LLM summary engine**. It downloads a video from a
+URL or uses a local file as input, and produces a timestamped Markdown summary.
 
-It download videos from url or use local video as input to generate a timestamp sammurize result
+## Requirements
 
+- Windows 10/11 with WebView2 (built in on Windows 11).
+- System **Python 3.10+** on `PATH` with CUDA-enabled libraries — the app calls
+  the system Python, it is not bundled:
+  ```bash
+  pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+  pip install transformers numpy soundfile funasr
+  ```
+  `huggingface_hub` / `modelscope` are needed only to download models from
+  inside the app.
+- `ffmpeg` on `PATH`:
+  ```bash
+  winget install Gyan.FFmpeg
+  winget install Python.Python.3.12
+  ```
 
-## Installation
+## Models (user-provided — not bundled)
 
-For windows, install python and ffmpeg is needed:
-```bash
-winget install Gyan.FFmpeg
-winget install Python.Python.3.12
-```
+On first launch a wizard (also available in **Settings**) configures:
 
-The following python libs are requires:
-```bash
-pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-pip install transformers numpy soundfile funasr
-```
- 
-Download a release or build it yourself, git clone current repo then run:
-```bash
-git clone https://huggingface.co/FunAudioLLM/SenseVoiceSmall ./model/SenseVoiceSmall
-git clone https://huggingface.co/iic/speech_fsmn_vad_zh-cn-16k-common-default ./model/fsmn-vad
-git clone https://huggingface.co/iic/speech_campplus_sv_zh-cn_16k-common ./model/cam++
-curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe -o yt-dlp.exe
-```
+- **ASR** (required): a local directory, or an in-app Hugging Face / ModelScope
+  download of `SenseVoiceSmall`, `Fun-ASR-Nano`, or
+  `Paraformer-zh-streaming`; or the online **Qwen3-ASR** API.
+- **VAD**: nothing to set up — the app bundles the Silero VAD model and runs it
+  natively on CPU.
+- **SPK** (optional): a `cam++` model directory for speaker identification.
+  Without it, every utterance is labelled `other`.
+- **Visual model (VideoNeko)**: the directory holding your fine-tuned ViT
+  `config.json` + `model.safetensors` + `preprocessor_config.json`.
 
-You may need to substitude the libDF with the files in `./diff`
+Video downloading is implemented in-process (no `yt-dlp.exe` required). Choose
+the summarization engine in Settings: an OpenAI-compatible API, a local
+**Ollama** server, or a **llama.cpp** server.
+
+## Build
 
 ```bash
 cd tauri-app
+npm install
 npm run tauri build
 ```
 
-## Finetune your model
-The base model is the `google/vit-base-patch16-224`, download it from hugging face use as default model, or finetune it with yourself. Tere is a example by using `sample.py` and `train.py`. you can download my simple  fine-fune model for vtuber `Ace Taffy` from release.
+The installer is written to
+`tauri-app/src-tauri/target/release/bundle/nsis/LiveNeko_<version>_x64-setup.exe`
+(e.g. `LiveNeko_0.1.10_x64-setup.exe`, ~9.6 MB, unsigned — since it is
+unsigned, Windows shows a SmartScreen warning on first run).
 
-Also, the spk/ dir provide a voiceprint for `Ace Taffy`.
+Settings, downloaded models, the speaker reference WAV, and results live under
+`%APPDATA%\com.liveneko.desktop\` (`config.json`, `funasr-models\`, `spk\`, and
+`results\<title>\` containing `summary.md`, `asr.txt`, `visual.txt`).
+
+## Finetune your model
+
+The visual base model is `google/vit-base-patch16-224`; the app uses the
+fine-tuned weights you point it at. `sample.py` extracts 1 fps frames from
+`data/` into `dataset/<tag>/`, and `train.py` fine-tunes on `dataset/` into
+`model/` — select that directory as the Visual model in the app. A sample
+fine-tune for the VTuber `Ace Taffy` is available in the releases; `spk/` holds a
+reference voiceprint for `Ace Taffy` (used by the standalone `AudioNeko.py`
+pipeline, not by the app).

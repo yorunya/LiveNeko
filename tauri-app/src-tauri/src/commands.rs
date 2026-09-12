@@ -2,7 +2,7 @@ use crate::assets::Assets;
 use crate::config::AppConfig;
 use crate::model_ipc::log_line;
 use crate::pipeline::{self, hide_console, ItemStatus, PipelineHandle, QueueItem, Runner};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,8 +25,9 @@ pub struct AppState {
 impl AppState {
     pub fn new(app_data_dir: PathBuf, os_theme: String, os_accent: Option<String>) -> Self {
         let mut config = AppConfig::load(&app_data_dir);
+        let data_root = config.data_root(&app_data_dir);
         if config.funasr_models_dir.trim().is_empty() {
-            config.funasr_models_dir = app_data_dir
+            config.funasr_models_dir = data_root
                 .join("funasr-models")
                 .to_string_lossy()
                 .to_string();
@@ -41,6 +42,14 @@ impl AppState {
             os_theme,
             os_accent,
         }
+    }
+
+    /// Effective root for user data (results/, work/, funasr-models/, spk/).
+    pub fn data_root(&self) -> PathBuf {
+        self.config
+            .lock()
+            .unwrap()
+            .data_root(&self.app_data_dir)
     }
 }
 
@@ -297,24 +306,57 @@ pub fn save_config(
     // preserve backend-managed fields that the settings UI does not send
     let existing = state.config.lock().unwrap().clone();
     config.env_checked = existing.env_checked;
-    config.normalize();
+    config.normalize(&state.app_data_dir);
 
-    // Speaker reference handling: the WAV is imported (16 kHz-checked, converted when needed) into <app_data>/spk/ at save time, so the file persists with the settings.
+    // Data directory: when the root changes, relocate the existing user data so
+    // nothing is left behind in the old location.
+    let old_root = existing.data_root(&state.app_data_dir);
+    let new_root = config.data_root(&state.app_data_dir);
+    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+    if old_root != new_root {
+        if state.running.load(Ordering::SeqCst) {
+            return Err(
+                "the data directory cannot be changed while the pipeline is running".to_string(),
+            );
+        }
+        validate_data_root(&new_root, &old_root)?;
+        std::fs::create_dir_all(&new_root)
+            .map_err(|e| format!("create data directory {}: {e}", new_root.display()))?;
+        rebase_funasr_paths(&mut config, &old_root, &new_root);
+        moved = move_data_dirs(&old_root, &new_root)?;
+    }
+
+    // Speaker reference handling: the WAV is imported (16 kHz-checked, converted
+    // when needed) into <dataRoot>/spk/ at save time, so the file persists with
+    // the settings. If anything after the move fails, put the data back.
+    match apply_speaker_and_save(&state, &mut config, &new_root, speaker_wav.as_deref()) {
+        Ok(()) => {
+            *state.config.lock().unwrap() = config;
+            Ok(())
+        }
+        Err(e) => {
+            rollback_moves(&moved);
+            Err(e)
+        }
+    }
+}
+
+/// Persist the speaker reference (importing a freshly picked WAV when given)
+/// and write config.json. Does not touch `AppState`.
+fn apply_speaker_and_save(
+    state: &AppState,
+    config: &mut AppConfig,
+    root: &Path,
+    speaker_wav: Option<&str>,
+) -> Result<(), String> {
     if config.speaker_name.is_empty() {
         // speaker identification off — drop any stored reference
-        let _ = std::fs::remove_dir_all(state.app_data_dir.join("spk"));
-    } else if speaker_wav.as_deref().is_some_and(|s| !s.trim().is_empty()) {
-        config.speaker_ref = import_speaker_wav(
-            &state,
-            speaker_wav.as_deref().unwrap(),
-            &config.speaker_name,
-        )?;
+        let _ = std::fs::remove_dir_all(root.join("spk"));
+    } else if speaker_wav.is_some_and(|s| !s.trim().is_empty()) {
+        config.speaker_ref = import_speaker_wav(root, speaker_wav.unwrap(), &config.speaker_name)?;
     } else {
         // keep the previously imported reference; it must still exist on disk
-        let wav = state
-            .app_data_dir
-            .join("spk")
-            .join(config.speaker_ref.trim());
+        let wav = root.join("spk").join(config.speaker_ref.trim());
         if config.speaker_ref.trim().is_empty() || !wav.exists() {
             return Err(format!(
                 "speaker \"{}\" needs a reference WAV file — choose one in Settings",
@@ -322,15 +364,121 @@ pub fn save_config(
             ));
         }
     }
+    config.save(&state.app_data_dir)
+}
 
-    config.save(&state.app_data_dir)?;
-    *state.config.lock().unwrap() = config;
+/// Reject a data directory that cannot safely become the new data root.
+fn validate_data_root(new_root: &Path, old_root: &Path) -> Result<(), String> {
+    if !new_root.is_absolute() {
+        return Err("data directory must be an absolute path".to_string());
+    }
+    if new_root.exists() && !new_root.is_dir() {
+        return Err(format!(
+            "data directory is a file, not a folder: {}",
+            new_root.display()
+        ));
+    }
+    // Moving the root into itself would recurse.
+    if new_root != old_root && new_root.starts_with(old_root) {
+        return Err(format!(
+            "data directory cannot be inside {}",
+            old_root.display()
+        ));
+    }
     Ok(())
 }
 
+/// Point the model paths at the new root when they referenced the old default
+/// model store (an externally-chosen store is left alone). `speaker_ref` is a
+/// bare filename, so it follows the spk root automatically.
+fn rebase_funasr_paths(config: &mut AppConfig, old_root: &Path, new_root: &Path) {
+    let old_store = old_root.join("funasr-models");
+    let new_store = new_root.join("funasr-models");
+    if config.funasr_models_dir.trim().is_empty() {
+        config.funasr_models_dir = new_store.to_string_lossy().to_string();
+    } else if Path::new(config.funasr_models_dir.trim()) == old_store {
+        config.funasr_models_dir = new_store.to_string_lossy().to_string();
+    }
+    for dir in [&mut config.asr_model_dir, &mut config.spk_model_dir] {
+        let trimmed = dir.trim().to_string();
+        if let Ok(rel) = Path::new(&trimmed).strip_prefix(&old_store) {
+            *dir = new_store.join(rel).to_string_lossy().to_string();
+        }
+    }
+}
+
+/// Move the user-data subdirectories into `new_root`, returning the pairs that
+/// were moved so a later failure can be rolled back. Refuses to merge into a
+/// destination that already holds data.
+fn move_data_dirs(old_root: &Path, new_root: &Path) -> Result<Vec<(PathBuf, PathBuf)>, String> {
+    const SUBDIRS: [&str; 4] = ["results", "work", "funasr-models", "spk"];
+    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for name in SUBDIRS {
+        let src = old_root.join(name);
+        if !src.exists() {
+            continue;
+        }
+        let dst = new_root.join(name);
+        if dst.exists() {
+            let non_empty = std::fs::read_dir(&dst)
+                .map(|mut d| d.next().is_some())
+                .unwrap_or(true);
+            if non_empty {
+                rollback_moves(&moved);
+                return Err(format!(
+                    "{} already contains data — choose an empty folder",
+                    dst.display()
+                ));
+            }
+            let _ = std::fs::remove_dir(&dst);
+        }
+        if let Err(e) = move_dir(&src, &dst) {
+            rollback_moves(&moved);
+            return Err(format!(
+                "move {} -> {}: {e}",
+                src.display(),
+                dst.display()
+            ));
+        }
+        moved.push((src, dst));
+    }
+    Ok(moved)
+}
+
+/// Rename a directory, falling back to copy+delete when it spans volumes.
+fn move_dir(src: &Path, dst: &Path) -> Result<(), String> {
+    if std::fs::rename(src, dst).is_ok() {
+        return Ok(());
+    }
+    copy_dir_recursive(src, dst).map_err(|e| e.to_string())?;
+    std::fs::remove_dir_all(src).map_err(|e| e.to_string())
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let to = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_recursive(&entry.path(), &to)?;
+        } else {
+            std::fs::copy(entry.path(), &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// Best-effort undo of `move_data_dirs` (a cross-volume rollback falls back to
+/// leaving the files where they are).
+fn rollback_moves(moved: &[(PathBuf, PathBuf)]) {
+    for (src, dst) in moved.iter().rev() {
+        let _ = std::fs::rename(dst, src);
+    }
+}
+
 /// Directory holding the imported speaker reference WAV(s).
-fn speaker_dir(state: &AppState) -> std::path::PathBuf {
-    state.app_data_dir.join("spk")
+fn speaker_dir(root: &Path) -> std::path::PathBuf {
+    root.join("spk")
 }
 
 /// Filesystem-safe stem derived from the speaker display name.
@@ -350,6 +498,35 @@ fn sanitize_speaker_stem(name: &str) -> String {
         trimmed
     };
     stem.chars().take(60).collect()
+}
+
+/// Folder name for a downloaded model, taken from the model name — the last
+/// segment of the hub repo id, with the org prefix dropped:
+/// `FunAudioLLM/SenseVoiceSmall` -> `SenseVoiceSmall`.
+fn model_folder_name(model_id: &str) -> String {
+    // Model name = the last non-empty path segment of the repo id.
+    let leaf = model_id
+        .trim()
+        .rsplit(|c| c == '/' || c == '\\')
+        .find(|s| !s.is_empty())
+        .unwrap_or("");
+    let mut out = String::new();
+    for c in leaf.chars() {
+        match c {
+            ':' | '*' | '?' | '"' | '<' | '>' | '|' => out.push('_'),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    // Windows forbids trailing spaces/dots in a path component.
+    while out.ends_with(' ') || out.ends_with('.') {
+        out.pop();
+    }
+    if out.is_empty() || out == "." || out == ".." {
+        "model".to_string()
+    } else {
+        out
+    }
 }
 
 /// Read the sample rate of `src` by parsing ffmpeg's stream info output
@@ -390,10 +567,10 @@ fn probe_wav_sample_rate(src: &std::path::Path) -> Result<u32, String> {
     ))
 }
 
-/// Import the user-provided reference WAV into <app_data>/spk/: verify with
+/// Import the user-provided reference WAV into `<root>/spk/`: verify with
 /// ffmpeg, convert to 16 kHz mono when needed, and keep exactly one reference
 /// file. Returns the stored filename (recorded in the config).
-fn import_speaker_wav(state: &AppState, src: &str, name: &str) -> Result<String, String> {
+fn import_speaker_wav(root: &Path, src: &str, name: &str) -> Result<String, String> {
     if run_capture("ffmpeg", &["-version"]).is_err() {
         return Err(
             "ffmpeg is required to import a speaker reference WAV but was not found".to_string(),
@@ -403,7 +580,7 @@ fn import_speaker_wav(state: &AppState, src: &str, name: &str) -> Result<String,
     if !src_path.exists() {
         return Err(format!("reference WAV not found: {src}"));
     }
-    let dir = speaker_dir(state);
+    let dir = speaker_dir(root);
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
 
     let file_name = format!("{}.wav", sanitize_speaker_stem(name));
@@ -489,6 +666,7 @@ pub fn get_setup_status(state: State<'_, AppState>) -> Result<serde_json::Value,
         "needsVideoneko": !model_ok,
         "needsFunasr": needs_funasr,
         "needsSpk": needs_spk,
+        "dataDir": cfg.data_root(&state.app_data_dir).to_string_lossy(),
         "videonekoModelDir": cfg.videoneko_model_dir,
         "funasrModelsDir": cfg.funasr_models_dir,
         "asrType": cfg.asr_type,
@@ -583,7 +761,8 @@ pub fn start_pipeline(app: AppHandle, state: State<'_, AppState>) -> Result<(), 
     state.pipeline.cancel.store(false, Ordering::SeqCst);
 
     // Open the run log file (work/pipeline.log);
-    let work_root = state.app_data_dir.join("work");
+    let data_root = cfg.data_root(&state.app_data_dir);
+    let work_root = data_root.join("work");
     let _ = std::fs::create_dir_all(&work_root);
     if let Ok(f) = std::fs::OpenOptions::new()
         .create(true)
@@ -598,8 +777,13 @@ pub fn start_pipeline(app: AppHandle, state: State<'_, AppState>) -> Result<(), 
     let handle = state.pipeline.clone();
 
     std::thread::spawn(move || {
-        let mut runner =
-            Runner::new(app2.clone(), assets.clone(), handle.clone(), cfg.cookie_browser.clone());
+        let mut runner = Runner::new(
+            app2.clone(),
+            assets.clone(),
+            handle.clone(),
+            cfg.cookie_browser.clone(),
+            data_root,
+        );
         // launch resident model servers ONCE (models load here, reused for all queued videos); they stay alive until the queue is done.
         if let Err(e) = runner.start_model_servers(&cfg) {
             log_line(
@@ -714,11 +898,16 @@ pub fn stop_pipeline(state: State<'_, AppState>) {
 
 /// Convert any such leftovers into `results/<stem>/<name>` directories.
 fn migrate_legacy_results(state: &AppState) {
-    let target = state.app_data_dir.join("results");
+    let data_root = state.data_root();
+    let target = data_root.join("results");
     std::fs::create_dir_all(&target).ok();
 
+    // Scan both the config root and the (possibly moved) data root, so legacy
+    // flat files are found regardless of where the data dir points.
     let mut flat_dirs = vec![
         state.app_data_dir.join("work").join("results"),
+        state.app_data_dir.join("results"),
+        data_root.join("work").join("results"),
         target.clone(),
     ];
     for legacy in flat_dirs.drain(..) {
@@ -763,7 +952,7 @@ pub fn list_results(state: State<'_, AppState>) -> Result<Vec<serde_json::Value>
     if !state.migrated.swap(true, Ordering::SeqCst) {
         migrate_legacy_results(state.inner());
     }
-    let results_dir = state.app_data_dir.join("results");
+    let results_dir = state.data_root().join("results");
     let mut out = Vec::new();
     if let Ok(rd) = std::fs::read_dir(&results_dir) {
         for entry in rd.flatten() {
@@ -800,7 +989,7 @@ pub fn list_results(state: State<'_, AppState>) -> Result<Vec<serde_json::Value>
 
 #[tauri::command]
 pub fn read_result(state: State<'_, AppState>, stem: String) -> Result<serde_json::Value, String> {
-    let results_dir = state.app_data_dir.join("results").join(&stem);
+    let results_dir = state.data_root().join("results").join(&stem);
     let summary = std::fs::read_to_string(results_dir.join("summary.md")).unwrap_or_default();
     let thinking = std::fs::read_to_string(results_dir.join("thinking.txt")).unwrap_or_default();
     let asr = std::fs::read_to_string(results_dir.join("asr.txt")).unwrap_or_default();
@@ -821,7 +1010,7 @@ pub fn search_results(
     query: String,
     use_regex: bool,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let results_dir = state.app_data_dir.join("results");
+    let results_dir = state.data_root().join("results");
     let mut out = Vec::new();
     let q = query.trim();
     if q.is_empty() {
@@ -952,7 +1141,7 @@ pub fn re_summarize(
     stem: String,
 ) -> Result<(), String> {
     let assets = crate::assets::Assets::resolve(&app);
-    let result_dir = state.app_data_dir.join("results").join(&stem);
+    let result_dir = state.data_root().join("results").join(&stem);
     let asr_path = result_dir.join("asr.txt");
     let visual_path = result_dir.join("visual.txt");
     if !asr_path.exists() {
@@ -962,21 +1151,20 @@ pub fn re_summarize(
         return Err(format!("stored visual.txt not found for '{stem}'"));
     }
     let config = state.config.lock().unwrap().clone();
+    let data_root = config.data_root(&state.app_data_dir);
     let runner = Runner::new(
         app.clone(),
         assets,
         state.pipeline.clone(),
         config.cookie_browser.clone(),
+        data_root.clone(),
     );
     // mark as running so the UI hides the Start button / shows state
     state.pipeline.cancel.store(false, Ordering::SeqCst);
     let app2 = app.clone();
     let stem2 = stem.clone();
     // write into a per-stem work dir, then move outputs into results/<stem> so a companion thinking.txt doesn't collide across concurrent re-summaries
-    let work_dir = state
-        .app_data_dir
-        .join("work")
-        .join(format!("resummarize-{stem}"));
+    let work_dir = data_root.join("work").join(format!("resummarize-{stem}"));
     std::fs::create_dir_all(&work_dir).map_err(|e| e.to_string())?;
     let work_dir2 = work_dir.clone();
     std::thread::spawn(move || {
@@ -1026,7 +1214,7 @@ pub fn re_summarize(
 
 #[tauri::command]
 pub fn export_result(state: State<'_, AppState>, stem: String, dest: String) -> Result<(), String> {
-    let results_dir = state.app_data_dir.join("results").join(&stem);
+    let results_dir = state.data_root().join("results").join(&stem);
     let src = results_dir.join("summary.md");
     std::fs::copy(&src, PathBuf::from(&dest)).map_err(|e| format!("copy: {e}"))?;
     Ok(())
@@ -1034,7 +1222,7 @@ pub fn export_result(state: State<'_, AppState>, stem: String, dest: String) -> 
 
 #[tauri::command]
 pub fn delete_result(state: State<'_, AppState>, stem: String) -> Result<(), String> {
-    let dir = state.app_data_dir.join("results").join(&stem);
+    let dir = state.data_root().join("results").join(&stem);
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())
 }
@@ -1084,7 +1272,11 @@ pub async fn validate_model_config(
     app: AppHandle,
     mut config: AppConfig,
 ) -> Result<serde_json::Value, String> {
-    config.normalize();
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .unwrap_or_else(|_| PathBuf::from("."));
+    config.normalize(&app_data_dir);
     tauri::async_runtime::spawn_blocking(move || {
         let assets = Assets::resolve(&app);
         validate_model_config_impl(&assets, &config)
@@ -1093,8 +1285,9 @@ pub async fn validate_model_config(
     .map_err(|e| format!("validate task failed: {e}"))?
 }
 
-/// Download a model snapshot from Hugging Face / ModelScope into the model
-/// directory. Progress is emitted as `model://progress` events with
+/// Download a model snapshot from Hugging Face / ModelScope into its own
+/// directory named after the model (`<base>/<asr|spk>/<model_folder_name>`).
+/// Progress is emitted as `model://progress` events with
 /// `{ "kind": "asr"|"spk", "progress": 0..100 }`.
 #[tauri::command]
 pub async fn download_model(
@@ -1124,7 +1317,7 @@ pub async fn download_model(
             let base = state.config.lock().unwrap().funasr_models_dir.clone();
             let base = if base.trim().is_empty() {
                 state
-                    .app_data_dir
+                    .data_root()
                     .join("funasr-models")
                     .to_string_lossy()
                     .to_string()
@@ -1133,6 +1326,7 @@ pub async fn download_model(
             };
             std::path::Path::new(&base)
                 .join(&kind)
+                .join(model_folder_name(&model_id))
                 .to_string_lossy()
                 .to_string()
         });
@@ -1279,6 +1473,111 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_validate_data_root() {
+        let base = std::env::temp_dir().join("liveneko_validate_data_root");
+        let old = base.join("old");
+        let nested = old.join("sub");
+        let other = base.join("new");
+        assert!(validate_data_root(Path::new("relative/dir"), &old).is_err());
+        assert!(validate_data_root(&nested, &old).is_err());
+        assert!(validate_data_root(&other, &old).is_ok());
+        // Reverting to the current root (the default) is allowed.
+        assert!(validate_data_root(&old, &old).is_ok());
+    }
+
+    #[test]
+    fn test_rebase_funasr_paths() {
+        let base = std::env::temp_dir().join("liveneko_rebase");
+        let old_root = base.join("old");
+        let new_root = base.join("new");
+        let old_store = old_root.join("funasr-models");
+        let new_store = new_root.join("funasr-models");
+        let external = base.join("external").join("campplus");
+
+        let mut cfg = AppConfig::new();
+        cfg.funasr_models_dir = old_store.to_string_lossy().to_string();
+        cfg.asr_model_dir = old_store
+            .join("asr")
+            .join("SenseVoiceSmall")
+            .to_string_lossy()
+            .to_string();
+        cfg.spk_model_dir = external.to_string_lossy().to_string();
+        rebase_funasr_paths(&mut cfg, &old_root, &new_root);
+        assert_eq!(cfg.funasr_models_dir, new_store.to_string_lossy().to_string());
+        assert_eq!(
+            cfg.asr_model_dir,
+            new_store
+                .join("asr")
+                .join("SenseVoiceSmall")
+                .to_string_lossy()
+                .to_string()
+        );
+        assert_eq!(
+            cfg.spk_model_dir,
+            external.to_string_lossy().to_string(),
+            "an external model store is left untouched"
+        );
+
+        let mut blank = AppConfig::new();
+        blank.funasr_models_dir = String::new();
+        rebase_funasr_paths(&mut blank, &old_root, &new_root);
+        assert_eq!(blank.funasr_models_dir, new_store.to_string_lossy().to_string());
+    }
+
+    #[test]
+    fn test_move_data_dirs() {
+        let base = std::env::temp_dir().join(format!("liveneko_move_{}", std::process::id()));
+        let old = base.join("old");
+        let new = base.join("new");
+        let _ = std::fs::remove_dir_all(&base);
+        let files = [
+            "results/video/summary.md",
+            "work/pipeline.log",
+            "funasr-models/asr/SenseVoiceSmall/model.pt",
+            "spk/taffy.wav",
+        ];
+        for file in files {
+            let p = old.join(file);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, b"x").unwrap();
+        }
+        let moved = move_data_dirs(&old, &new).unwrap();
+        assert_eq!(moved.len(), 4);
+        for file in files {
+            assert!(new.join(file).is_file(), "missing after move: {file}");
+            assert!(!old.join(file).exists(), "not moved: {file}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_move_data_dirs_rejects_non_empty_destination() {
+        let base = std::env::temp_dir().join(format!("liveneko_move_reject_{}", std::process::id()));
+        let old = base.join("old");
+        let new = base.join("new");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(old.join("results")).unwrap();
+        std::fs::write(old.join("results/a.md"), b"x").unwrap();
+        std::fs::create_dir_all(new.join("results")).unwrap();
+        std::fs::write(new.join("results/existing.md"), b"y").unwrap();
+        assert!(move_data_dirs(&old, &new).is_err());
+        // the source is untouched after a refusal
+        assert!(old.join("results/a.md").is_file());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_move_data_dirs_is_noop_when_sources_missing() {
+        let base = std::env::temp_dir().join(format!("liveneko_move_none_{}", std::process::id()));
+        let old = base.join("old");
+        let new = base.join("new");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&old).unwrap();
+        assert!(move_data_dirs(&old, &new).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn test_sanitize_speaker_stem() {
         assert_eq!(sanitize_speaker_stem("taffy"), "taffy");
         assert_eq!(sanitize_speaker_stem("  taffy  cat  "), "taffy cat");
@@ -1288,6 +1587,27 @@ mod tests {
         );
         assert_eq!(sanitize_speaker_stem("///"), "speaker");
         assert_eq!(sanitize_speaker_stem(""), "speaker");
+    }
+
+    #[test]
+    fn test_model_folder_name() {
+        // Only the model name is used; the org prefix is dropped.
+        assert_eq!(
+            model_folder_name("FunAudioLLM/SenseVoiceSmall"),
+            "SenseVoiceSmall"
+        );
+        assert_eq!(model_folder_name("funasr/campplus"), "campplus");
+        assert_eq!(
+            model_folder_name("iic/speech_campplus_sv_zh-cn_16k-common"),
+            "speech_campplus_sv_zh-cn_16k-common"
+        );
+        // Bare ids and multi-segment / trailing-separator ids.
+        assert_eq!(model_folder_name("Model"), "Model");
+        assert_eq!(model_folder_name("a/b/Model"), "Model");
+        assert_eq!(model_folder_name("  plain  "), "plain");
+        assert_eq!(model_folder_name("name."), "name");
+        assert_eq!(model_folder_name(""), "model");
+        assert_eq!(model_folder_name(".."), "model");
     }
 
     #[test]

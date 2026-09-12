@@ -55,9 +55,11 @@ The installer is written to
 (e.g. `LiveNeko_0.1.10_x64-setup.exe`, ~9.6 MB, unsigned — since it is
 unsigned, Windows shows a SmartScreen warning on first run).
 
-Settings, downloaded models, the speaker reference WAV, and results live under
-`%APPDATA%\com.liveneko.desktop\` (`config.json`, `funasr-models\`, `spk\`, and
-`results\<title>\` containing `summary.md`, `asr.txt`, `visual.txt`).
+Settings live in `%APPDATA%\com.liveneko.desktop\config.json` (always there).
+Everything else — `results\<title>\` (`summary.md`, `asr.txt`, `visual.txt`),
+`funasr-models\` and `spk\` — goes to the **data directory**, which is chosen in
+the first-run wizard and can be changed later in Settings; changing it moves the
+existing data. It defaults to `%APPDATA%\com.liveneko.desktop\`.
 
 ## Finetune your model
 

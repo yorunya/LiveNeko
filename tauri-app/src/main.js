@@ -118,6 +118,11 @@ const I18N = {
     "results.searchError": "Search error:",
     "settings.languageTitle": "Language",
     "settings.languageSystem": "System default",
+    "settings.storageLangTitle": "Storage & language",
+    "settings.dataDirTitle": "Data directory",
+    "settings.dataDirPlaceholder": "Path to the data directory",
+    "settings.dataDirHint": "Where results, downloaded models and speaker files are saved. Changing it moves the existing data to the new folder. App settings always stay in the system folder.",
+    "settings.videoDlTitle": "Video download",
     "settings.envTitle": "Environment Check",
     "settings.recheck": "Re-check environment",
     "settings.funasrTitle": "FunASR audio models",
@@ -149,8 +154,6 @@ const I18N = {
     "settings.videonekoHint": "Visual model directory (must contain config.json, model.safetensors, preprocessor_config.json).",
     "settings.videonekoPlaceholder": "Path to VideoNeko model directory",
     "settings.browse": "Browse…",
-    "settings.speakerTitle": "Speaker identification",
-    "settings.speakerEnable": "Identify a specific speaker",
     "settings.speakerName": "Speaker name",
     "settings.speakerNamePlaceholder": "e.g. taffy",
     "settings.speakerBrowse": "Choose reference WAV…",
@@ -167,7 +170,6 @@ const I18N = {
     "settings.nrLowpass": "Lowpass (Hz, 0 = off)",
     "settings.nrNr": "afftdn nr — noise reduction (dB)",
     "settings.nrNf": "afftdn nf — noise floor (dB)",
-    "settings.cookiesTitle": "Browser cookies",
     "settings.cookiesHint": "Optionally reuse the login cookies of a local browser for video downloads (same source as yt-dlp --cookies-from-browser). Useful for logged-in / higher-quality downloads. Downloads also work without it. Close the selected browser while downloading so its cookie database can be read.",
     "settings.cookiesBrowser": "Read cookies from",
     "settings.cookiesOff": "Disabled",
@@ -195,18 +197,10 @@ const I18N = {
     "settings.connectionOk": "Connection OK ✓",
     "settings.connectionOkProbe": "Credentials verified ✓ — the model rejected the silent probe clip (some models need ~2s of real speech).",
     "settings.connectionFailed": "Failed",
-    "status.ready": "Ready.",
-    "status.checkingEnv": "Checking environment…",
-    "status.envComplete": "Environment check complete.",
-    "status.envFailed": "Environment check failed:",
-    "status.running": "Pipeline running…",
-    "status.finished": "Pipeline finished.",
-    "status.stopRequested": "Stop requested…",
     "status.addUrlFailed": "Add URL failed:",
     "status.addFileFailed": "Add file failed:",
     "status.startFailed": "Start failed:",
     "status.setupFailed": "Setup failed:",
-    "status.setupComplete": "Setup complete.",
     "env.python": "Python",
     "env.ffmpeg": "ffmpeg",
     "env.cuda": "CUDA (GPU)",
@@ -215,17 +209,13 @@ const I18N = {
     "env.missing": "missing",
     "env.missingLibs": "missing:",
     "env.runCheck": "Run a check to see environment status.",
-    "env.cudaOn": "on",
-    "env.cudaOff": "off",
-    "env.libsOk": "ok",
-    "env.libsMissing": "missing",
-    "env.cudaLabel": "CUDA",
-    "env.libsLabel": "Python libs",
     "log.finished": "finished OK",
     "log.cancelled": "cancelled",
     "log.failed": "failed:",
     "setup.welcome": "Welcome to LiveNeko 👋",
     "setup.hint": "Let's get everything configured. Complete the steps below — the pipeline needs an ASR model (VAD is built in), your VideoNeko model and a summarization engine.",
+    "setup.stepDataDir": "Choose where to save your data",
+    "setup.stepDataDirHint": "Results, downloaded models and speaker files are saved here. You can change this later in Settings; changing it moves the existing data to the new folder.",
     "setup.step1": "Select your VideoNeko model weights",
     "setup.step1Hint": "Browse for the directory containing your fine-tuned ViT weights (config.json, model.safetensors, preprocessor_config.json).",
     "setup.step2": "Choose a summarization engine",
@@ -297,6 +287,11 @@ const I18N = {
     "results.searchError": "搜索错误：",
     "settings.languageTitle": "语言",
     "settings.languageSystem": "跟随系统",
+    "settings.storageLangTitle": "存储与语言",
+    "settings.dataDirTitle": "数据目录",
+    "settings.dataDirPlaceholder": "数据目录路径",
+    "settings.dataDirHint": "结果、下载的模型和说话人文件都保存在这里。修改后会把现有数据移动到新目录；应用设置始终保存在系统目录中。",
+    "settings.videoDlTitle": "视频下载",
     "settings.envTitle": "环境检查",
     "settings.recheck": "重新检查环境",
     "settings.funasrTitle": "FunASR 语音模型",
@@ -328,8 +323,6 @@ const I18N = {
     "settings.videonekoHint": "视觉模型目录（需包含 config.json、model.safetensors、preprocessor_config.json）。",
     "settings.videonekoPlaceholder": "视觉模型目录路径",
     "settings.browse": "浏览…",
-    "settings.speakerTitle": "说话人识别",
-    "settings.speakerEnable": "识别指定说话人",
     "settings.speakerName": "说话人名称",
     "settings.speakerNamePlaceholder": "例如 taffy",
     "settings.speakerBrowse": "选择参考 WAV…",
@@ -346,7 +339,6 @@ const I18N = {
     "settings.nrLowpass": "低通（Hz，0 = 关闭）",
     "settings.nrNr": "afftdn nr — 降噪强度（dB）",
     "settings.nrNf": "afftdn nf — 噪声底（dB）",
-    "settings.cookiesTitle": "浏览器 Cookie",
     "settings.cookiesHint": "可选择在下载视频时复用本地浏览器的登录 Cookie（数据来源与 yt-dlp --cookies-from-browser 相同）。适合需要登录或更高清晰度的下载；不开启也能正常下载。下载时请先关闭所选浏览器，否则无法读取其 Cookie 数据库。",
     "settings.cookiesBrowser": "读取 Cookie 的浏览器",
     "settings.cookiesOff": "不启用",
@@ -374,18 +366,10 @@ const I18N = {
     "settings.connectionOk": "连接正常 ✓",
     "settings.connectionOkProbe": "凭证已验证 ✓ — 模型拒绝了静音测试片段（部分模型需要约 2 秒真实语音）。",
     "settings.connectionFailed": "失败",
-    "status.ready": "就绪。",
-    "status.checkingEnv": "正在检查环境…",
-    "status.envComplete": "环境检查完成。",
-    "status.envFailed": "环境检查失败：",
-    "status.running": "分析中",
-    "status.finished": "分析完成",
-    "status.stopRequested": "已请求停止",
     "status.addUrlFailed": "添加链接失败：",
     "status.addFileFailed": "添加文件失败：",
     "status.startFailed": "启动失败：",
     "status.setupFailed": "设置失败：",
-    "status.setupComplete": "设置完成。",
     "env.python": "Python",
     "env.ffmpeg": "ffmpeg",
     "env.cuda": "CUDA（GPU）",
@@ -394,17 +378,13 @@ const I18N = {
     "env.missing": "缺失",
     "env.missingLibs": "缺失：",
     "env.runCheck": "运行检查以查看环境状态。",
-    "env.cudaOn": "开",
-    "env.cudaOff": "关",
-    "env.libsOk": "正常",
-    "env.libsMissing": "缺失",
-    "env.cudaLabel": "CUDA",
-    "env.libsLabel": "Python 库",
     "log.finished": "完成",
     "log.cancelled": "已取消",
     "log.failed": "失败：",
     "setup.welcome": "欢迎使用 LiveNeko 👋",
     "setup.hint": "让我们完成配置。完成以下步骤——分析需要提供 ASR 语音模型（VAD 已内置）、视觉模型和摘要引擎。",
+    "setup.stepDataDir": "选择数据保存目录",
+    "setup.stepDataDirHint": "结果、下载的模型和说话人文件都保存在这里。之后可在设置中修改；修改后会把现有数据移动到新目录。",
     "setup.step1": "选择视觉模型",
     "setup.step1Hint": "选择视觉模型目录（包括config.json、model.safetensors、preprocessor_config.json）。",
     "setup.step2": "选择摘要引擎",
@@ -452,14 +432,6 @@ function setLanguage(l) {
 
 // ---------- helpers ----------
 const $ = (sel) => document.querySelector(sel);
-
-function setStatus(text) {
-  $("#status-text").textContent = text;
-}
-
-function setModelStatus(text) {
-  $("#model-status").textContent = text;
-}
 
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) => ({
@@ -601,14 +573,11 @@ function flushLog() {
 
 // ---------- env + settings ----------
 async function refreshEnv(force = false) {
-  setStatus(t("status.checkingEnv"));
   try {
     state.env = await invoke("check_environment", { force });
     renderEnv();
-    setModelStatus(`${t("env.cudaLabel")} ${state.env.cuda ? t("env.cudaOn") : t("env.cudaOff")} · ${t("env.libsLabel")} ${state.env.pythonLibraries ? t("env.libsOk") : t("env.libsMissing")}`);
-    setStatus(t("status.envComplete"));
   } catch (e) {
-    setStatus(`${t("status.envFailed")} ${e}`);
+    console.error(e);
   }
 }
 
@@ -670,6 +639,7 @@ async function loadSettings() {
   $("#cfg-llamacpp-model").value = state.config.llamacppModel || "";
   $("#cfg-llamacpp-thinking").checked = !!state.config.llamacppThinking;
   $("#cfg-language").value = state.config.language || "";
+  $("#cfg-data-dir").value = state.config.dataDir || "";
   setSpeakerSettings();
   setLanguage(state.config.language || "");
   setEngine(state.config.engine || "api");
@@ -697,10 +667,9 @@ async function loadSettings() {
 }
 
 function setSpeakerSettings() {
-  const enabled = !!(state.config.speakerName || "").trim();
-  $("#cfg-spk-enabled").checked = enabled;
-  $("#cfg-spk-name").value = enabled ? state.config.speakerName : "";
-  $("#spk-settings").classList.toggle("hidden", !enabled);
+  // The speaker fields live inside the SPK-model submenu, so visibility is
+  // driven by setSpkModelSettings(); here we only restore the stored values.
+  $("#cfg-spk-name").value = state.config?.speakerName || "";
   renderSpkFileStatus();
 }
 
@@ -845,8 +814,9 @@ async function testAsrApi() {
 function collectConfig() {
   const engine = document.querySelector('input[name="engine"]:checked')?.value || "api";
   const qualityInput = document.querySelector('input[name="quality"]:checked');
-  const spkEnabled = $("#cfg-spk-enabled").checked;
-  const spkName = spkEnabled ? $("#cfg-spk-name").value.trim() : "";
+  // Speaker identification is shown/required only while the SPK model is on.
+  const spkModelEnabled = $("#cfg-spk-model-enabled").checked;
+  const spkName = spkModelEnabled ? $("#cfg-spk-name").value.trim() : "";
   return {
     videonekoModelDir: $("#cfg-videoneko").value.trim(),
     engine,
@@ -858,10 +828,11 @@ function collectConfig() {
     afftdnNf: parseInt($("#cfg-nr-nf").value) || -50,
     cookieBrowser: $("#cfg-cookie-browser").value,
     language: $("#cfg-language").value,
+    dataDir: $("#cfg-data-dir").value.trim(),
     customPrompt: $("#cfg-prompt").value,
     speakerName: spkName,
     // keep the stored reference unless a new WAV was picked
-    speakerRef: spkEnabled && !state.speakerWav ? state.config?.speakerRef || "" : "",
+    speakerRef: spkModelEnabled && !state.speakerWav ? state.config?.speakerRef || "" : "",
     funasrModelsDir: state.config?.funasrModelsDir || "",
     asrType: $("#cfg-asr-type").value,
     asrSource: $("#cfg-asr-source").value,
@@ -893,15 +864,15 @@ function collectConfig() {
 }
 
 async function saveSettings() {
-  const spkEnabled = $("#cfg-spk-enabled").checked;
-  const spkName = spkEnabled ? $("#cfg-spk-name").value.trim() : "";
-  if (spkEnabled && !spkName) {
+  const spkModelEnabled = $("#cfg-spk-model-enabled").checked;
+  const spkName = spkModelEnabled ? $("#cfg-spk-name").value.trim() : "";
+  if (spkModelEnabled && !spkName) {
     $("#save-status").textContent = t("settings.speakerNameRequired");
     return;
   }
   // A speaker needs a reference WAV: either one picked in this session or the
   // previously imported file (kept on the backend until the speaker changes).
-  if (spkEnabled && !state.speakerWav && !(state.config?.speakerRef || "").trim()) {
+  if (spkModelEnabled && !state.speakerWav && !(state.config?.speakerRef || "").trim()) {
     $("#save-status").textContent = t("settings.speakerWavRequired");
     return;
   }
@@ -1118,7 +1089,6 @@ async function wireEvents() {
   await listen("pipeline://start", () => {
     state.running = true;
     renderRunControls();
-    setStatus(t("status.running"));
   });
   await listen("pipeline://done", (e) => {
     const { itemId, ok, error, cancelled } = e.payload;
@@ -1132,7 +1102,6 @@ async function wireEvents() {
   await listen("pipeline://finished", async () => {
     state.running = false;
     renderRunControls();
-    setStatus(t("status.finished"));
     refreshQueue();
     refreshResults();
     if (state.activeResult) {
@@ -1177,7 +1146,7 @@ async function addUrl() {
     $("#url-input").value = "";
     refreshQueue();
   } catch (e) {
-    setStatus(`${t("status.addUrlFailed")} ${e}`);
+    console.error(`${t("status.addUrlFailed")} ${e}`);
   }
 }
 
@@ -1188,7 +1157,7 @@ async function addFile() {
   });
   if (!files) return;
   for (const f of Array.isArray(files) ? files : [files]) {
-    try { await invoke("add_local_file", { path: f }); } catch (e) { setStatus(`${t("status.addFileFailed")} ${e}`); }
+    try { await invoke("add_local_file", { path: f }); } catch (e) { console.error(`${t("status.addFileFailed")} ${e}`); }
   }
   refreshQueue();
 }
@@ -1197,13 +1166,12 @@ async function startPipeline() {
   try {
     await invoke("start_pipeline");
   } catch (e) {
-    setStatus(`${t("status.startFailed")} ${e}`);
+    console.error(`${t("status.startFailed")} ${e}`);
   }
 }
 
 async function stopPipeline() {
   await invoke("stop_pipeline");
-  setStatus(t("status.stopRequested"));
 }
 
 function browseVideoneko() {
@@ -1258,6 +1226,7 @@ async function checkSetup() {
       $("#setup-modal").classList.remove("hidden");
       const cfg = state.config || {};
       $("#setup-videoneko").value = s.videonekoModelDir || "";
+      $("#setup-data-dir").value = s.dataDir || cfg.dataDir || "";
       $("#setup-asr-type").value = cfg.asrType || "sensevoice-small";
       $("#setup-asr-source").value = cfg.asrSource || "huggingface";
       $("#setup-asr-id").value = cfg.asrModelId || defaultModelId(cfg.asrType || "sensevoice-small", $("#setup-asr-source").value);
@@ -1294,6 +1263,7 @@ function setupValues() {
   const engine = document.querySelector('input[name="setup-engine"]:checked')?.value || "api";
   return {
     videonekoModelDir: $("#setup-videoneko").value.trim(),
+    dataDir: $("#setup-data-dir").value.trim(),
     engine,
     apiBaseUrl: $("#setup-api-base").value.trim(),
     apiKey: $("#setup-api-key").value.trim(),
@@ -1328,7 +1298,6 @@ async function finishSetup() {
     state.config = await invoke("get_config");
     $("#setup-modal").classList.add("hidden");
     loadSettings();
-    setStatus(t("status.setupComplete"));
   } catch (e) {
     statusEl.textContent = `${t("status.setupFailed")} ${e}`;
   } finally {
@@ -1366,6 +1335,7 @@ function init() {
   $("#btn-clear").addEventListener("click", async () => { await invoke("clear_queue"); refreshQueue(); });
   $("#btn-recheck").addEventListener("click", () => refreshEnv(true));
   $("#btn-browse-videoneko").addEventListener("click", browseVideoneko);
+  $("#btn-browse-data-dir").addEventListener("click", () => browseDir("#cfg-data-dir"));
   // FunASR model configuration
   $("#cfg-asr-type").addEventListener("change", () => {
     const type = $("#cfg-asr-type").value;
@@ -1401,10 +1371,8 @@ function init() {
   $("#setup-download-asr").addEventListener("click", () =>
     downloadModel("asr", "#setup-asr-source", "#setup-asr-id", "#setup-asr-dir", "#setup-funasr-status"));
   $("#setup-browse-asr").addEventListener("click", () => browseDir("#setup-asr-dir"));
-  $("#cfg-spk-enabled").addEventListener("change", () => {
-    $("#spk-settings").classList.toggle("hidden", !$("#cfg-spk-enabled").checked);
-  });
-  $("#btn-browse-spk").addEventListener("click", browseSpeakerWav);
+  $("#setup-browse-data-dir").addEventListener("click", () => browseDir("#setup-data-dir"));
+  $("#btn-browse-spk-wav").addEventListener("click", browseSpeakerWav);
   $("#btn-test-api").addEventListener("click", testApi);
   $("#btn-test-ollama").addEventListener("click", () => testEngine("ollama", $("#ollama-test-status")));
   $("#btn-test-llamacpp").addEventListener("click", () => testEngine("llamacpp", $("#llamacpp-test-status")));

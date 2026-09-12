@@ -79,14 +79,21 @@
         <!-- Settings view -->
         <section id="tab-settings" class="view">
           <div class="card">
-            <h2 data-i18n="settings.languageTitle">Language</h2>
+            <h2 data-i18n="settings.storageLangTitle">Storage &amp; language</h2>
             <div class="row">
-              <select id="cfg-language" style="flex:0 1 240px;">
-                <option value="" data-i18n="settings.languageSystem">System default</option>
-                <option value="en">English</option>
-                <option value="zh">中文</option>
-              </select>
+              <div class="wide"><span data-i18n="settings.dataDirTitle">Data directory</span>
+                <input id="cfg-data-dir" type="text" data-i18n-placeholder="settings.dataDirPlaceholder" placeholder="Path to the data directory" />
+                <button id="btn-browse-data-dir" class="btn" data-i18n="settings.browse">Browse…</button>
+              </div>
+              <label class="wide"><span data-i18n="settings.languageTitle">Language</span>
+                <select id="cfg-language">
+                  <option value="" data-i18n="settings.languageSystem">System default</option>
+                  <option value="en">English</option>
+                  <option value="zh">中文</option>
+                </select>
+              </label>
             </div>
+            <p class="hint" data-i18n="settings.dataDirHint">Where results, downloaded models and speaker files are saved. Changing it moves the existing data to the new folder. App settings always stay in the system folder.</p>
           </div>
 
           <div class="card">
@@ -161,6 +168,14 @@
                 <button id="btn-validate-spk" class="btn ghost small" data-i18n="settings.validate">Validate</button>
                 <span id="spk-status" class="hint"></span>
               </div>
+
+              <div class="row">
+                <label class="wide"><span data-i18n="settings.speakerName">Speaker name</span> <input id="cfg-spk-name" type="text" data-i18n-placeholder="settings.speakerNamePlaceholder" placeholder="e.g. taffy" /></label>
+              </div>
+              <div class="row">
+                <button id="btn-browse-spk-wav" class="btn" data-i18n="settings.speakerBrowse">Choose reference WAV…</button>
+                <span id="spk-file" class="hint"></span>
+              </div>
             </div>
           </div>
 
@@ -192,33 +207,14 @@
           </div>
 
           <div class="card">
-            <h2 data-i18n="settings.speakerTitle">Speaker identification</h2>
+            <h2 data-i18n="settings.videoDlTitle">Video download</h2>
             <div class="row">
-              <label class="inline"><input type="checkbox" id="cfg-spk-enabled" /> <span data-i18n="settings.speakerEnable">Identify a specific speaker</span></label>
-            </div>
-            <div id="spk-settings" class="sub-card hidden">
-              <div class="row"><label class="wide"><span data-i18n="settings.speakerName">Speaker name</span> <input id="cfg-spk-name" type="text" data-i18n-placeholder="settings.speakerNamePlaceholder" placeholder="e.g. taffy" /></label></div>
-              <div class="row">
-                <button id="btn-browse-spk" class="btn" data-i18n="settings.speakerBrowse">Choose reference WAV…</button>
-                <span id="spk-file" class="hint"></span>
+              <div class="wide"><span data-i18n="settings.qualityTitle">Video download quality</span><br />
+                <label><input type="radio" name="quality" value="360" /> 360P</label>
+                <label><input type="radio" name="quality" value="480" /> 480P</label>
+                <label><input type="radio" name="quality" value="720" /> 720P</label>
+                <label><input type="radio" name="quality" value="1080" /> 1080P</label>
               </div>
-            </div>
-          </div>
-
-          <div class="card">
-            <h2 data-i18n="settings.qualityTitle">Video download quality</h2>
-            <div class="row">
-              <label><input type="radio" name="quality" value="360" /> 360P</label>
-              <label><input type="radio" name="quality" value="480" /> 480P</label>
-              <label><input type="radio" name="quality" value="720" /> 720P</label>
-              <label><input type="radio" name="quality" value="1080" /> 1080P</label>
-            </div>
-          </div>
-
-          <div class="card">
-            <h2 data-i18n="settings.cookiesTitle">Browser cookies</h2>
-            <p class="hint" data-i18n="settings.cookiesHint">Optionally reuse the login cookies of a local browser for video downloads (same source as yt-dlp --cookies-from-browser). Useful for logged-in / higher-quality downloads. Downloads also work without it. Close the selected browser while downloading so its cookie database can be read.</p>
-            <div class="row">
               <label class="wide"><span data-i18n="settings.cookiesBrowser">Read cookies from</span>
                 <select id="cfg-cookie-browser">
                   <option value="" data-i18n="settings.cookiesOff">Disabled</option>
@@ -228,6 +224,7 @@
                 </select>
               </label>
             </div>
+            <p class="hint" data-i18n="settings.cookiesHint">Optionally reuse the login cookies of a local browser for video downloads (same source as yt-dlp --cookies-from-browser). Useful for logged-in / higher-quality downloads. Downloads also work without it. Close the selected browser while downloading so its cookie database can be read.</p>
           </div>
 
           <div class="card">
@@ -289,11 +286,6 @@
         </section>
       </main>
 
-      <footer class="statusbar">
-        <span id="status-text" data-i18n="status.ready">Ready.</span>
-        <span id="model-status" class="hint"></span>
-      </footer>
-
       <!-- First-launch setup wizard -->
       <div id="setup-modal" class="modal-overlay hidden">
         <div class="modal">
@@ -302,6 +294,17 @@
           <div class="setup-steps">
             <div class="setup-step">
               <span class="step-num">1</span>
+              <div class="step-body">
+                <strong data-i18n="setup.stepDataDir">Choose where to save your data</strong>
+                <p class="hint" data-i18n="setup.stepDataDirHint">Results, downloaded models and speaker files are saved here. You can change this later in Settings; changing it moves the existing data to the new folder.</p>
+                <div class="row">
+                  <input id="setup-data-dir" type="text" data-i18n-placeholder="settings.dataDirPlaceholder" placeholder="Path to the data directory" />
+                  <button id="setup-browse-data-dir" class="btn" data-i18n="settings.browse">Browse…</button>
+                </div>
+              </div>
+            </div>
+            <div class="setup-step">
+              <span class="step-num">2</span>
               <div class="step-body">
                 <strong data-i18n="setup.stepFunasr">Configure FunASR audio models</strong>
                 <p class="hint" data-i18n="setup.stepFunasrHint">ASR models are not bundled. Choose a model type and download it from Hugging Face / ModelScope, or pick an existing local directory. VAD needs no setup (bundled native Silero).</p>
@@ -343,7 +346,7 @@
               </div>
             </div>
             <div class="setup-step">
-              <span class="step-num">2</span>
+              <span class="step-num">3</span>
               <div class="step-body">
                 <strong data-i18n="setup.step1">Select your VideoNeko model weights</strong>
                 <p class="hint" data-i18n="setup.step1Hint">Browse for the directory containing your fine-tuned ViT weights (config.json, model.safetensors, preprocessor_config.json).</p>
@@ -354,7 +357,7 @@
               </div>
             </div>
             <div class="setup-step">
-              <span class="step-num">3</span>
+              <span class="step-num">4</span>
               <div class="step-body">
                 <strong data-i18n="setup.step2">Choose a summarization engine</strong>
                 <p class="hint" data-i18n="setup.step2Hint">Select where the summary LLM runs: a hosted OpenAI-compatible API, a local Ollama server, or a llama.cpp server.</p>

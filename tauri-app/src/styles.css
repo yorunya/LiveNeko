@@ -365,16 +365,6 @@ button:focus-visible, summary:focus-visible { outline: 2px solid var(--primary);
 .env-bad { color: var(--danger); }
 
 /* Status bar */
-.statusbar {
-  display: flex;
-  justify-content: space-between;
-  padding: 6px 20px;
-  border-top: 1px solid var(--border);
-  background: var(--card);
-  font-size: 12px;
-  color: var(--muted);
-}
-
 /* Setup modal */
 .modal-overlay {
   position: fixed;

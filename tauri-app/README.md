@@ -42,8 +42,10 @@ Settings) you configure:
 Each model can be:
 - an existing local directory (validated for the expected files/config and
   model type), or
-- downloaded from **Hugging Face** or **ModelScope** into
-  `<app_data>/funasr-models/<asr|spk>` (or a directory you pick).
+- downloaded from **Hugging Face** or **ModelScope** into its own
+  per-model folder, `<app_data>/funasr-models/<asr|spk>/<model-name>` (e.g.
+  `funasr-models/asr/SenseVoiceSmall` — the org prefix is dropped), or into a
+  directory you pick.
 
 ASR model paths (and the Qwen3-ASR endpoint fields) are validated before a
 run starts; the Qwen3-ASR connection can be probed with *Test connection*.
@@ -83,15 +85,22 @@ root `AGENTS.md` (`cargo xwin` shim + `--target x86_64-pc-windows-msvc`).
 ## First launch
 1. The app runs an environment + asset check once; the result is cached in
    `env_report.json` (`env_checked` in config) so later launches skip it.
-2. **Configure the ASR model** — choose an ASR type (or the Qwen3-ASR API)
+2. **Choose the data directory** — where `results/`, `work/`, the FunASR model
+   store and `spk/` are written. It defaults to
+   `%APPDATA%\com.liveneko.desktop\` and can be changed later in Settings;
+   changing it moves the existing data to the new folder.
+3. **Configure the ASR model** — choose an ASR type (or the Qwen3-ASR API)
    and a local directory or a Hugging Face / ModelScope download. VAD needs no
-   setup (bundled native Silero). The SPK (`cam++`) model is optional.
-3. If no VideoNeko model directory is set, the wizard asks you to pick one
+   setup (bundled native Silero). The SPK (`cam++`) model is optional; when it
+   is enabled, a speaker name and reference WAV are required, and speaker
+   identification is configured under it.
+4. If no VideoNeko model directory is set, the wizard asks you to pick one
    (the directory holding your fine-tuned `config.json` + `model.safetensors`
    + `preprocessor_config.json`).
-4. Pick a summarization engine: an OpenAI-compatible API, a local Ollama
+5. Pick a summarization engine: an OpenAI-compatible API, a local Ollama
    server, or a llama.cpp server (base URL + model).
-5. Settings are saved to `%APPDATA%\com.liveneko.desktop\config.json`.
+6. Settings are saved to `%APPDATA%\com.liveneko.desktop\config.json` (always in
+   the system app-data folder, not in the data directory).
 
 ## Pipeline
 Each queued video runs through the 4 stages with progress and logs. At the start
@@ -126,10 +135,11 @@ and passes it to `audio_server.py --config`.
 The servers are shut down when the queue finishes (or when Stop Analysis is
 pressed — their PIDs are killed too).
 
-Results land in `%APPDATA%\com.liveneko.desktop\results\<title>\` — one directory
-per video named after its resolved title. Each directory holds `summary.md`,
-`asr.txt`, `visual.txt`, (when the model reasoned) `thinking.txt`, and the video
-file.
+Results land in `<data-dir>\results\<title>\` — one directory per video named
+after its resolved title. Each directory holds `summary.md`, `asr.txt`,
+`visual.txt`, (when the model reasoned) `thinking.txt`, and the video file. The
+data dir defaults to `%APPDATA%\com.liveneko.desktop\` and is set in the wizard
+or Settings.
 
 The Results page renders the summary as HTML: timestamped entries are shown as
 styled blocks, the model's thinking is folded inside a collapsible

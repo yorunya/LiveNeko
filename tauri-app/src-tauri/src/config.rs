@@ -30,10 +30,14 @@ pub struct AppConfig {
     pub env_checked: bool,
     /// Speaker display name used in transcripts (e.g. "taffy"). Empty = no speaker identification.
     pub speaker_name: String,
-    /// Reference WAV filename (16 kHz mono) stored under <app_data>/spk/. Empty = none.
+    /// Reference WAV filename (16 kHz mono) stored under <dataDir>/spk/. Empty = none.
     pub speaker_ref: String,
     /// UI language: "" (system default) | "en" | "zh".
     pub language: String,
+    /// Root for user data — results/, work/, funasr-models/ and spk/.
+    /// Empty = the default app-data dir (preserves existing installs).
+    /// config.json itself always lives in the app-data dir, never here.
+    pub data_dir: String,
 
     // ---- FunASR audio models (user-provided; never bundled) ----
     /// Base directory used for models downloaded from Hugging Face / ModelScope.
@@ -136,6 +140,7 @@ impl AppConfig {
             speaker_name: String::new(),
             speaker_ref: String::new(),
             language: String::new(),
+            data_dir: String::new(),
             funasr_models_dir: String::new(),
             asr_type: "sensevoice-small".to_string(),
             asr_source: "huggingface".to_string(),
@@ -170,6 +175,18 @@ impl AppConfig {
         app_data_dir.join("config.json")
     }
 
+    /// Effective root for user data (results/, work/, funasr-models/, spk/).
+    /// Falls back to the app-data dir when `data_dir` is unset or blank, so an
+    /// existing install behaves exactly as before.
+    pub fn data_root(&self, app_data_dir: &std::path::Path) -> PathBuf {
+        let dir = self.data_dir.trim();
+        if dir.is_empty() {
+            app_data_dir.to_path_buf()
+        } else {
+            PathBuf::from(dir)
+        }
+    }
+
     /// True when the online Qwen3-ASR backend is selected.
     pub fn asr_is_api(&self) -> bool {
         self.asr_type == "qwen3-api"
@@ -186,14 +203,20 @@ impl AppConfig {
         }
     }
 
-    /// Normalize/migrate field values so they always hold valid defaults
-    pub fn normalize(&mut self) {
+    /// Normalize/migrate field values so they always hold valid defaults.
+    /// `app_data_dir` is needed to resolve an unset `data_dir` to the default.
+    pub fn normalize(&mut self, app_data_dir: &std::path::Path) {
         if self.engine.is_empty() || !matches!(self.engine.as_str(), "api" | "ollama" | "llamacpp")
         {
             self.engine = "api".to_string();
         }
         if !matches!(self.language.as_str(), "" | "en" | "zh") {
             self.language = String::new();
+        }
+        // Data root: blank means "the app-data dir" (the historical default).
+        self.data_dir = self.data_dir.trim().to_string();
+        if self.data_dir.is_empty() {
+            self.data_dir = app_data_dir.to_string_lossy().to_string();
         }
         // Speaker: a name without a reference means no speaker identification;
         // the name is a free-form display label, so only trim and cap its length.
@@ -278,7 +301,7 @@ impl AppConfig {
         } else {
             Self::new()
         };
-        cfg.normalize();
+        cfg.normalize(app_data_dir);
         cfg
     }
 
@@ -286,5 +309,53 @@ impl AppConfig {
         std::fs::create_dir_all(app_data_dir).map_err(|e| e.to_string())?;
         let text = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
         std::fs::write(Self::config_file_path(app_data_dir), text).map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn data_root_defaults_to_app_data_dir() {
+        let mut cfg = AppConfig::new();
+        cfg.data_dir = String::new();
+        assert_eq!(cfg.data_root(Path::new("/app")), PathBuf::from("/app"));
+
+        cfg.data_dir = "   ".to_string();
+        assert_eq!(cfg.data_root(Path::new("/app")), PathBuf::from("/app"));
+    }
+
+    #[test]
+    fn data_root_honours_explicit_dir() {
+        let mut cfg = AppConfig::new();
+        cfg.data_dir = "/data/liveneko".to_string();
+        assert_eq!(
+            cfg.data_root(Path::new("/app")),
+            PathBuf::from("/data/liveneko")
+        );
+    }
+
+    #[test]
+    fn normalize_fills_and_trims_data_dir() {
+        let mut blank = AppConfig::new();
+        blank.data_dir = "   ".to_string();
+        blank.normalize(Path::new("/app"));
+        assert_eq!(blank.data_dir, "/app");
+
+        let mut custom = AppConfig::new();
+        custom.data_dir = "  /custom  ".to_string();
+        custom.normalize(Path::new("/app"));
+        assert_eq!(custom.data_dir, "/custom");
+    }
+
+    #[test]
+    fn serde_data_dir_defaults_to_empty_and_round_trips() {
+        let cfg: AppConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.data_dir, "");
+
+        let cfg: AppConfig = serde_json::from_str(r#"{"dataDir":"/x"}"#).unwrap();
+        assert_eq!(cfg.data_dir, "/x");
     }
 }

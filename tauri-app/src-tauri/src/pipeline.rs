@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter};
 
 /// Prevent a console window from flashing up when spawning subprocesses from a GUI app.
 #[cfg(windows)]
@@ -116,6 +116,9 @@ pub struct Runner {
     pub app: AppHandle,
     pub assets: Assets,
     pub handle: PipelineHandle,
+    /// Root for user data (results/, work/, spk/). Resolved from the configurable
+    /// data dir; defaults to the app-data dir.
+    pub data_root: PathBuf,
     current_stage: u8,
     /// 1-based part currently being processed (1 for single videos).
     current_part: u32,
@@ -183,11 +186,18 @@ fn build_audio_config(
 }
 
 impl Runner {
-    pub fn new(app: AppHandle, assets: Assets, handle: PipelineHandle, cookie_browser: String) -> Self {
+    pub fn new(
+        app: AppHandle,
+        assets: Assets,
+        handle: PipelineHandle,
+        cookie_browser: String,
+        data_root: PathBuf,
+    ) -> Self {
         Self {
             app,
             assets,
             handle,
+            data_root,
             current_stage: 0,
             current_part: 1,
             total_parts: 1,
@@ -252,12 +262,7 @@ impl Runner {
             refs.as_ref()
                 .map(|(w, n, segs)| (w.as_path(), n.as_str(), segs.as_slice())),
         );
-        let config_dir = self
-            .app
-            .path()
-            .app_data_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join("work");
+        let config_dir = self.data_root.join("work");
         let _ = std::fs::create_dir_all(&config_dir);
         let config_path = config_dir.join("audio_server.json");
         std::fs::write(
@@ -367,12 +372,7 @@ impl Runner {
         if name.is_empty() {
             return Ok(None);
         }
-        let dir = self
-            .app
-            .path()
-            .app_data_dir()
-            .map_err(|e| format!("app data dir: {e}"))?
-            .join("spk");
+        let dir = self.data_root.join("spk");
         let wav = dir.join(config.speaker_ref.trim());
         if config.speaker_ref.trim().is_empty() || !wav.is_file() {
             return Err(format!(
@@ -1531,12 +1531,7 @@ pub fn run_item(
     runner.emit_stage(&id, 1, 0);
 
     // Resolve the video title first, then create results/<title>/ to hold all of this video's outputs (and, for URL downloads, the video files).
-    let results_dir = runner
-        .app
-        .path()
-        .app_data_dir()
-        .map_err(|e| e.to_string())?
-        .join("results");
+    let results_dir = runner.data_root.join("results");
     std::fs::create_dir_all(&results_dir).map_err(|e| e.to_string())?;
 
     let (videos, video_title, title_dir) = if let Some(url) = &item.url {
@@ -1721,7 +1716,7 @@ mod tests {
         cfg.lowpass_hz = 1;
         cfg.afftdn_nr = 200.0;
         cfg.afftdn_nf = 0;
-        cfg.normalize();
+        cfg.normalize(std::path::Path::new("/tmp/liveneko-test"));
         assert_eq!(cfg.highpass_hz, 20000);
         assert_eq!(cfg.lowpass_hz, 0, "lowpass below highpass is dropped");
         assert_eq!(cfg.afftdn_nr, 97.0);

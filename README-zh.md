@@ -51,9 +51,10 @@ npm run tauri build
 （例如 `LiveNeko_0.1.10_x64-setup.exe`，约 9.6 MB，未签名 —— 由于未签名，首次
 运行会触发 Windows SmartScreen 警告）。
 
-设置、下载的模型、说话人参考音频和结果都保存在
-`%APPDATA%\com.liveneko.desktop\`（`config.json`、`funasr-models\`、`spk\`，以及
-`results\<标题>\`，内含 `summary.md`、`asr.txt`、`visual.txt`）。
+设置始终保存在 `%APPDATA%\com.liveneko.desktop\config.json`。其余数据——`results\<标题>\`
+（`summary.md`、`asr.txt`、`visual.txt`）、`funasr-models\` 和 `spk\`——保存在
+**数据目录**中，该目录在首次启动向导中选择，之后可在设置中修改；修改时会把
+现有数据移动到新目录。默认位置为 `%APPDATA%\com.liveneko.desktop\`。
 
 ## 微调模型
 

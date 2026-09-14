@@ -145,6 +145,12 @@
               <div class="row"><label class="wide"><span data-i18n="settings.languageOptional">Language hint</span> <input id="cfg-qwen3-language" type="text" data-i18n-placeholder="settings.languagePlaceholder" placeholder="optional (zh / en / auto)" /></label></div>
               <div class="row"><button id="btn-test-asr-api" class="btn small" data-i18n="settings.testConnection">Test connection</button><span id="asr-api-status" class="hint"></span></div>
             </div>
+            <div class="row">
+              <label class="wide"><span data-i18n="settings.asrConcurrency">Max ASR concurrency</span>
+                <input id="cfg-asr-concurrency" type="number" min="1" max="32" step="1" />
+              </label>
+            </div>
+            <p class="hint" data-i18n="settings.asrConcurrencyHint">Simultaneous ASR requests (default 5). 1 keeps the sequential behavior; higher values speed up the online API and local models.</p>
 
             <h3 data-i18n="settings.spkModelTitle">SPK model (cam++, optional)</h3>
             <div class="row"><label class="inline"><input type="checkbox" id="cfg-spk-model-enabled" /> <span data-i18n="settings.spkModelEnable">Use a SPK model for speaker identification</span></label></div>
@@ -385,6 +391,33 @@
           <div class="row right">
             <button id="setup-skip" class="btn ghost" data-i18n="setup.skip">Skip for now</button>
             <button id="setup-finish" class="btn success" data-i18n="setup.finish">Finish Setup</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Multi-part video picker (shown when an added URL yields several videos) -->
+      <div id="parts-modal" class="modal-overlay hidden">
+        <div class="modal">
+          <h2 data-i18n="picker.title">Select videos</h2>
+          <p class="hint"><span id="parts-video-title"></span></p>
+          <div class="parts-toolbar">
+            <button id="parts-all" class="btn ghost small" data-i18n="picker.all">All</button>
+            <button id="parts-none" class="btn ghost small" data-i18n="picker.none">None</button>
+          </div>
+          <div class="parts-list" id="parts-list"></div>
+          <div class="parts-options">
+            <label class="check">
+              <input type="checkbox" id="parts-merge" />
+              <span>
+                <span data-i18n="picker.merge">Merge selected into one video</span>
+                <span class="hint" data-i18n="picker.mergeHint">The selected parts are concatenated in list order and analyzed as a single recording.</span>
+              </span>
+            </label>
+            <p class="hint" data-i18n="picker.separateHint">Otherwise each selected video becomes its own task in the queue.</p>
+          </div>
+          <div class="row right">
+            <button id="parts-cancel" class="btn ghost" data-i18n="picker.cancel">Cancel</button>
+            <button id="parts-add" class="btn success" data-i18n="picker.add">Add</button>
           </div>
         </div>
       </div>

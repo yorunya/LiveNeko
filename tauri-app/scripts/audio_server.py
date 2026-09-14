@@ -115,13 +115,22 @@ def quiet_stdout():
 class LocalAsr:
     """FunASR AutoModel ASR loaded from a local model directory."""
 
-    def __init__(self, model_type, model_dir, device, language=""):
+    def __init__(self, model_type, model_dir, device, language="", concurrency=1):
         if model_type not in LOCAL_ASR_TYPES:
             raise RuntimeError(f"unsupported local ASR type: {model_type}")
         if not model_dir or not os.path.isdir(model_dir):
             raise RuntimeError(f"ASR model directory not found: {model_dir}")
         self.name = model_type
         self.language = (language or "").strip()
+        # Concurrent batch workers share the GPU: scale funasr's internal
+        # packing down so N in-flight generates hold roughly the same peak
+        # audio-seconds (and thus activation memory) as one sequential one.
+        if self.name == "sensevoice-small":
+            self.batch_size_s = max(30, ASR_BATCH_SIZE_S // max(1, concurrency))
+        elif self.name == "fun-asr-nano":
+            self.batch_size_s = max(30, ASR_BATCH_SIZE_S_NANO // max(1, concurrency))
+        else:
+            self.batch_size_s = 0  # streaming paraformer packs per chunk
         log.info(f"Loading ASR model '{model_type}' from {model_dir}")
         self.model = AutoModel(
             model=model_dir,
@@ -161,12 +170,12 @@ class LocalAsr:
             # Preserve the historical behavior: Chinese + inverse text normalization.
             kwargs["language"] = self.language or "zh"
             kwargs["use_itn"] = True
-            kwargs["batch_size_s"] = ASR_BATCH_SIZE_S
+            kwargs["batch_size_s"] = self.batch_size_s
         else:  # fun-asr-nano
             if self.language:
                 kwargs["language"] = self.language
             kwargs["itn"] = True
-            kwargs["batch_size_s"] = ASR_BATCH_SIZE_S_NANO
+            kwargs["batch_size_s"] = self.batch_size_s
         results = self.model.generate(input=chunks, **kwargs)
         return [r.get("text", "") for r in results]
 
@@ -231,7 +240,7 @@ class Qwen3ApiAsr:
         return texts
 
 
-def build_asr(config, device):
+def build_asr(config, device, concurrency=1):
     asr_cfg = config.get("asr") or {}
     backend = asr_cfg.get("backend", "local")
     if backend == "qwen3-api":
@@ -246,6 +255,7 @@ def build_asr(config, device):
         asr_cfg.get("dir", ""),
         device,
         asr_cfg.get("language", ""),
+        concurrency=concurrency,
     )
 
 
@@ -303,7 +313,8 @@ def _speaker_embeddings_matrix(chunks, long_idx, spk):
 
 # ---- transcription pipeline ----
 
-def transcribe_samples(speech, segments, asr, spk, ref_matrix, speaker_name, on_progress=None):
+def transcribe_samples(speech, segments, asr, spk, ref_matrix, speaker_name, on_progress=None,
+                       max_concurrency=1):
     utterances = []
     total = max(len(segments), 1)
 
@@ -316,6 +327,7 @@ def transcribe_samples(speech, segments, asr, spk, ref_matrix, speaker_name, on_
         batches.append((batch, chunks, long_idx))
 
     def finalize(batch, long_idx, results, spk_emb):
+        rows = []
         sims = {}
         if ref_matrix is not None and spk_emb is not None:
             sims = dict(zip(long_idx, np.max(ref_matrix @ spk_emb.T, axis=0)))
@@ -324,33 +336,64 @@ def transcribe_samples(speech, segments, asr, spk, ref_matrix, speaker_name, on_
             # `res` is the worker result dict ({"text": ...}); the Rust IPC
             # contract expects a plain string as the 4th utterance element.
             text = res.get("text", "") if isinstance(res, dict) else str(res)
-            utterances.append([int(start_ms), int(end_ms), speaker, text])
+            rows.append([int(start_ms), int(end_ms), speaker, text])
+        return rows
 
-    # Pipeline ASR (main thread) and SPK (worker thread): the SPK pass of batch i
-    # overlaps the ASR pass of batch i+1. Without a SPK model or reference
-    # voiceprint the SPK pass is skipped entirely.
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as spk_executor:
-        pending = None
-        for idx, (batch, chunks, long_idx) in enumerate(batches):
-            texts = asr.transcribe(chunks)
-            results = [{"text": text} for text in texts]
+    def run_batch(args):
+        # One unit of ASR work: transcribe the batch's chunks and, when a SPK
+        # model + reference are configured, embed the same chunks.
+        batch, chunks, long_idx = args
+        texts = asr.transcribe(chunks)
+        results = [{"text": text} for text in texts]
+        spk_emb = None
+        if long_idx and ref_matrix is not None and spk is not None:
+            spk_emb = _speaker_embeddings_matrix(chunks, long_idx, spk)
+        return finalize(batch, long_idx, results, spk_emb)
+
+    if max_concurrency <= 1 or len(batches) <= 1:
+        # Historical sequential path: ASR (main thread) batch by batch with the
+        # SPK pass of batch i pipelined behind ASR of batch i+1. Without a SPK
+        # model or reference voiceprint the SPK pass is skipped entirely.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as spk_executor:
+            pending = None
+            for idx, (batch, chunks, long_idx) in enumerate(batches):
+                texts = asr.transcribe(chunks)
+                results = [{"text": text} for text in texts]
+                if pending is not None:
+                    p_batch, p_long_idx, p_results, p_future = pending
+                    spk_emb = p_future.result() if p_future is not None else None
+                    utterances.extend(finalize(p_batch, p_long_idx, p_results, spk_emb))
+                if long_idx and ref_matrix is not None and spk is not None:
+                    future = spk_executor.submit(_speaker_embeddings_matrix, chunks, long_idx, spk)
+                else:
+                    future = None
+                pending = (batch, long_idx, results, future)
+                if on_progress:
+                    on_progress(min(100, int((idx + 1) * ASR_BATCH / total * 100)))
+
             if pending is not None:
-                p_batch, p_long_idx, p_results, p_future = pending
-                spk_emb = p_future.result() if p_future is not None else None
-                finalize(p_batch, p_long_idx, p_results, spk_emb)
-            if long_idx and ref_matrix is not None and spk is not None:
-                future = spk_executor.submit(_speaker_embeddings_matrix, chunks, long_idx, spk)
-            else:
-                future = None
-            pending = (batch, long_idx, results, future)
+                batch, long_idx, results, future = pending
+                spk_emb = future.result() if future is not None else None
+                utterances.extend(finalize(batch, long_idx, results, spk_emb))
+
+        return utterances
+
+    # Concurrent path: up to max_concurrency batches in flight; results are
+    # reassembled in batch order so the utterance list is identical to the
+    # sequential path's.
+    log.info(f"ASR concurrency: up to {min(max_concurrency, len(batches))} batch(es) in flight")
+    rows_by_batch = [None] * len(batches)
+    workers = min(max_concurrency, len(batches))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(run_batch, args): i for i, args in enumerate(batches)}
+        done = 0
+        for future in concurrent.futures.as_completed(futures):
+            rows_by_batch[futures[future]] = future.result()
+            done += 1
             if on_progress:
-                on_progress(min(100, int((idx + 1) * ASR_BATCH / total * 100)))
-
-        if pending is not None:
-            batch, long_idx, results, future = pending
-            spk_emb = future.result() if future is not None else None
-            finalize(batch, long_idx, results, spk_emb)
-
+                on_progress(min(100, int(done * ASR_BATCH / total * 100)))
+    for rows in rows_by_batch:
+        utterances.extend(rows)
     return utterances
 
 
@@ -374,7 +417,7 @@ def parse_segments(raw):
     return segments
 
 
-def process(req, asr, spk, ref_matrix, speaker_name):
+def process(req, asr, spk, ref_matrix, speaker_name, max_concurrency=1):
     rid = req.get("id", "")
     input_wav = req.get("input", "")
     if not input_wav:
@@ -394,6 +437,7 @@ def process(req, asr, spk, ref_matrix, speaker_name):
         utterances = transcribe_samples(
             speech, segments, asr, spk, ref_matrix, speaker_name,
             on_progress=lambda p: progress(20 + p * 0.8),
+            max_concurrency=max_concurrency,
         )
         send({"cmd": "process", "id": rid, "ok": True, "utterances": utterances})
     except Exception as e:
@@ -425,12 +469,21 @@ def main():
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     log.info(f"Device: {device}")
 
+    # Max simultaneously processed ASR batches (1 = sequential). The Rust
+    # backend always writes the key; a missing/invalid value means sequential.
+    try:
+        asr_concurrency = max(1, min(int(config.get("asrConcurrency", 1) or 1), 32))
+    except (TypeError, ValueError):
+        asr_concurrency = 1
+    if asr_concurrency > 1:
+        log.info(f"ASR concurrency: {asr_concurrency}")
+
     spk = None
     ref_matrix = None
     speaker_name = ""
     try:
         with quiet_stdout():
-            asr = build_asr(config, device)
+            asr = build_asr(config, device, concurrency=asr_concurrency)
             spk_cfg = config.get("spk") or {}
             if spk_cfg.get("dir"):
                 spk = load_spk(spk_cfg["dir"], device)
@@ -474,7 +527,7 @@ def main():
             log.info("shutdown")
             break
         elif cmd == "process":
-            process(req, asr, spk, ref_matrix, speaker_name)
+            process(req, asr, spk, ref_matrix, speaker_name, max_concurrency=asr_concurrency)
         else:
             send({"cmd": cmd, "id": req.get("id", ""), "ok": False,
                   "error": f"unknown cmd {cmd}"})

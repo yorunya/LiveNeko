@@ -86,6 +86,15 @@ const I18N = {
     "pipeline.clear": "Clear",
     "pipeline.queueEmpty": "Queue is empty. Add a URL or local video above.",
     "pipeline.log": "Log",
+    "picker.title": "Select videos",
+    "picker.merge": "Merge selected into one video",
+    "picker.mergeHint": "The selected parts are concatenated in list order and analyzed as a single recording.",
+    "picker.separateHint": "Otherwise each selected video becomes its own task in the queue.",
+    "picker.cancel": "Cancel",
+    "picker.add": "Add",
+    "picker.all": "All",
+    "picker.none": "None",
+    "picker.noneSelected": "Select at least one video.",
     "results.searchPlaceholder": "Search titles & contents (regex supported)",
     "results.regex": "regex",
     "results.search": "Search",
@@ -137,6 +146,8 @@ const I18N = {
     "settings.spkDirPlaceholder": "Path to the cam++ model directory",
     "settings.languageOptional": "Language hint",
     "settings.languagePlaceholder": "optional (zh / en / auto)",
+    "settings.asrConcurrency": "Max ASR concurrency",
+    "settings.asrConcurrencyHint": "Simultaneous ASR requests (default 5). 1 keeps the sequential behavior; higher values speed up the online API and local models.",
     "settings.download": "Download",
     "settings.validate": "Validate",
     "settings.valid": "valid ✓",
@@ -255,6 +266,15 @@ const I18N = {
     "pipeline.clear": "清空",
     "pipeline.queueEmpty": "队列为空。请在上方添加链接或本地视频。",
     "pipeline.log": "日志",
+    "picker.title": "选择视频",
+    "picker.merge": "将所选视频合并为一个",
+    "picker.mergeHint": "所选分P将按列表顺序拼接成一个视频，作为单个录像分析。",
+    "picker.separateHint": "不合并时，每个所选视频会作为独立任务加入队列。",
+    "picker.cancel": "取消",
+    "picker.add": "添加",
+    "picker.all": "全选",
+    "picker.none": "全不选",
+    "picker.noneSelected": "请至少选择一个视频。",
     "results.searchPlaceholder": "搜索标题和内容（支持正则）",
     "results.regex": "正则",
     "results.search": "搜索",
@@ -306,6 +326,8 @@ const I18N = {
     "settings.spkDirPlaceholder": "cam++ 模型目录路径",
     "settings.languageOptional": "语言提示",
     "settings.languagePlaceholder": "可选（zh / en / auto）",
+    "settings.asrConcurrency": "ASR 最大并发数",
+    "settings.asrConcurrencyHint": "同时处理的 ASR 请求数（默认 5）。设为 1 保持串行行为；更大的值可加速在线 API 与本地模型。",
     "settings.download": "下载",
     "settings.validate": "校验",
     "settings.valid": "有效 ✓",
@@ -617,6 +639,7 @@ async function loadSettings() {
   $("#cfg-asr-id").value = state.config.asrModelId || defaultModelId(state.config.asrType, state.config.asrSource);
   $("#cfg-asr-dir").value = state.config.asrModelDir || "";
   $("#cfg-asr-language").value = state.config.asrLanguage || "";
+  $("#cfg-asr-concurrency").value = state.config.asrConcurrency || 5;
   $("#cfg-spk-model-enabled").checked = !!(state.config.spkEnabled && (state.config.spkModelDir || "").trim());
   $("#cfg-spk-source").value = state.config.spkSource || "huggingface";
   $("#cfg-spk-id").value = state.config.spkModelId || defaultModelId("cam++", state.config.spkSource);
@@ -839,6 +862,7 @@ function collectConfig() {
     asrModelId: $("#cfg-asr-id").value.trim(),
     asrModelDir: $("#cfg-asr-dir").value.trim(),
     asrLanguage: $("#cfg-asr-language").value.trim(),
+    asrConcurrency: parseInt($("#cfg-asr-concurrency").value) || 5,
     spkEnabled: $("#cfg-spk-model-enabled").checked,
     spkSource: $("#cfg-spk-source").value,
     spkModelId: $("#cfg-spk-id").value.trim(),
@@ -1142,11 +1166,81 @@ async function addUrl() {
   const url = $("#url-input").value.trim();
   if (!url) return;
   try {
+    // Probe what the URL yields first; a multi-video page opens the picker.
+    // Probe failure falls through to a plain add (add_url re-probes and
+    // degrades to a placeholder title), preserving the old behavior.
+    let info = null;
+    try { info = await invoke("list_url_videos", { url }); } catch { info = null; }
+    if (info && Array.isArray(info.parts) && info.parts.length > 1) {
+      openPartsPicker(url, info);
+      return; // the input is cleared when the picker confirms
+    }
     await invoke("add_url", { url });
     $("#url-input").value = "";
     refreshQueue();
   } catch (e) {
     console.error(`${t("status.addUrlFailed")} ${e}`);
+  }
+}
+
+// ---------- multi-part video picker ----------
+let pickerState = null;
+
+function openPartsPicker(url, info) {
+  pickerState = { url, title: info.title, parts: info.parts };
+  $("#parts-video-title").textContent = info.title;
+  $("#parts-list").innerHTML = info.parts
+    .map((p) => `
+      <label class="parts-row">
+        <input type="checkbox" data-part="${p.index}" checked />
+        <span class="parts-idx">P${p.index}</span>
+        <span class="parts-name">${esc(p.title)}</span>
+      </label>`)
+    .join("");
+  // merge matches the app's historic multi-part behavior (one recording)
+  $("#parts-merge").checked = true;
+  updatePartsPicker();
+  $("#parts-modal").classList.remove("hidden");
+}
+
+function closePartsPicker() {
+  $("#parts-modal").classList.add("hidden");
+  pickerState = null;
+}
+
+function selectedParts() {
+  return [...document.querySelectorAll("#parts-list input:checked")]
+    .map((el) => Number(el.dataset.part))
+    .filter((n) => Number.isFinite(n));
+}
+
+function updatePartsPicker() {
+  const n = selectedParts().length;
+  $("#parts-merge").disabled = n < 2;
+  $("#parts-add").disabled = n === 0;
+}
+
+async function confirmPartsPicker() {
+  if (!pickerState) return;
+  const selected = selectedParts();
+  if (selected.length === 0) return;
+  const url = pickerState.url;
+  closePartsPicker();
+  $("#url-input").value = "";
+  try {
+    if ($("#parts-merge").checked && selected.length > 1) {
+      // merged: one queue task analyzing the concatenated video
+      await invoke("add_url", { url, parts: selected });
+    } else {
+      // separate: one queue task per selected video, in list order
+      for (const part of selected) {
+        await invoke("add_url", { url, parts: [part] });
+      }
+    }
+    refreshQueue();
+  } catch (e) {
+    console.error(`${t("status.addUrlFailed")} ${e}`);
+    refreshQueue();
   }
 }
 
@@ -1327,6 +1421,18 @@ function applyLanguage() {
 function init() {
   $("#btn-add-url").addEventListener("click", addUrl);
   $("#url-input").addEventListener("keydown", (e) => { if (e.key === "Enter") addUrl(); });
+  // multi-part picker
+  $("#parts-list").addEventListener("change", updatePartsPicker);
+  $("#parts-all").addEventListener("click", () => {
+    document.querySelectorAll("#parts-list input[type=checkbox]").forEach((el) => { el.checked = true; });
+    updatePartsPicker();
+  });
+  $("#parts-none").addEventListener("click", () => {
+    document.querySelectorAll("#parts-list input[type=checkbox]").forEach((el) => { el.checked = false; });
+    updatePartsPicker();
+  });
+  $("#parts-cancel").addEventListener("click", closePartsPicker);
+  $("#parts-add").addEventListener("click", confirmPartsPicker);
   $("#btn-add-file").addEventListener("click", addFile);
   $("#btn-run").addEventListener("click", () => {
     if (state.running) stopPipeline();

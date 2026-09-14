@@ -53,6 +53,11 @@ pub struct QueueItem {
     /// Total parts for a multi-part URL (1 otherwise).
     pub total_parts: u32,
     pub error: Option<String>,
+    /// Selected anthology pages (1-based, yt-dlp --playlist-items
+    /// equivalent): None = all parts; Some with >1 page = the user chose to
+    /// merge those parts into one video before analysis.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parts: Option<Vec<u32>>,
 }
 
 impl QueueItem {
@@ -67,6 +72,7 @@ impl QueueItem {
             current_part: 1,
             total_parts: 1,
             error: None,
+            parts: None,
         }
     }
     pub fn from_file(id: String, path: String) -> Self {
@@ -84,6 +90,7 @@ impl QueueItem {
             current_part: 1,
             total_parts: 1,
             error: None,
+            parts: None,
         }
     }
 }
@@ -182,6 +189,8 @@ fn build_audio_config(
         "asr": asr,
         "spk": spk,
         "ref": refs_json,
+        // Max simultaneously processed ASR batches in the worker (1 = sequential).
+        "asrConcurrency": config.asr_concurrency,
     })
 }
 
@@ -673,11 +682,12 @@ impl Runner {
         url: &str,
         out_dir: &Path,
         quality: u32,
+        parts: Option<&[u32]>,
     ) -> Result<bool, String> {
         self.emit_log(item_id, format!("[downloader] downloading {url}"));
         let cookies = self.load_cookies_once()?;
         let dl = self.make_downloader(item_id, cookies);
-        let files = dl.download(url, out_dir, quality)?;
+        let files = dl.download(url, out_dir, quality, parts)?;
         self.emit_log(
             item_id,
             format!("[downloader] download complete ({} file(s))", files.len()),
@@ -698,26 +708,46 @@ impl Runner {
             .collect())
     }
 
-    /// Download ALL videos from a URL into out_dir, preserving playlist order in the filenames and merging each part's video/audio streams into a single file.
+    /// Download the selected videos (or ALL videos when `parts` is None) from
+    /// a URL into out_dir, preserving playlist order in the filenames and
+    /// merging each part's video/audio streams into a single file.
     fn ytdlp_download_playlist(
         &self,
         item_id: &str,
         url: &str,
         out_dir: &Path,
         quality: u32,
+        parts: Option<&[u32]>,
     ) -> Result<bool, String> {
-        self.emit_log(
-            item_id,
-            format!("[downloader] downloading all videos: {url}"),
-        );
+        let what = match parts {
+            Some(ps) => format!("{} selected video(s)", ps.len()),
+            None => "all videos".to_string(),
+        };
+        self.emit_log(item_id, format!("[downloader] downloading {what}: {url}"));
         let cookies = self.load_cookies_once()?;
         let dl = self.make_downloader(item_id, cookies);
-        let files = dl.download(url, out_dir, quality)?;
+        let files = dl.download(url, out_dir, quality, parts)?;
         self.emit_log(
             item_id,
             format!("[downloader] download complete ({} file(s))", files.len()),
         );
         Ok(true)
+    }
+
+    /// Concatenate downloaded multi-part files into one video with the
+    /// downloader's stream-copy merge (ffmpeg concat demuxer).
+    fn merge_videos(&self, item_id: &str, files: &[PathBuf], dest: &Path) -> Result<(), String> {
+        self.emit_log(
+            item_id,
+            format!(
+                "[downloader] merging {} part(s) into {}",
+                files.len(),
+                dest.display()
+            ),
+        );
+        let cookies = self.load_cookies_once().ok().flatten();
+        let dl = self.make_downloader(item_id, cookies);
+        dl.merge_videos(files, dest)
     }
 
     /// Duration of a media file in whole seconds (via ffprobe).
@@ -1003,7 +1033,13 @@ fn split_think_summary(text: &str) -> (String, String) {
     (thinking, summary)
 }
 
-/// Download all videos from a URL directly into `dl_dir` (the results/<title>/ dir) and return the ordered media files. Multi-part pages are NOT merged here —each part is returned in p0N order for separate analysis; the final asr/visual are merged with timestamp offsets by the caller.
+/// Download the videos a URL yields (all of them, or the selected anthology
+/// pages) into `dl_dir` (the results/<title>/ dir) and return the ordered
+/// media files. When more than one part was selected (merge choice), the parts
+/// are concatenated into a single <title>.mp4 up front and only that file is
+/// returned. Otherwise multi-part pages are NOT merged — each part is returned
+/// in p0N order for separate analysis; the final asr/visual are merged with
+/// timestamp offsets by the caller.
 fn download_from_url(
     runner: &Runner,
     item_id: &str,
@@ -1011,17 +1047,23 @@ fn download_from_url(
     dl_dir: &Path,
     quality: u32,
     title: &str,
+    parts: Option<&[u32]>,
 ) -> Result<Vec<PathBuf>, String> {
     // Probe how many videos the URL yields ("title*1 p01 title*2" per part).
     let titles = runner.ytdlp_list_titles(item_id, url)?;
     runner.emit_log(item_id, format!("URL yields {} video(s)", titles.len()));
 
-    if titles.len() <= 1 {
+    // Effective video count: the selection when the user picked pages (empty
+    // selection = all), else everything the URL yields.
+    let count = parts
+        .filter(|p| !p.is_empty())
+        .map_or(titles.len(), <[u32]>::len);
+    if count <= 1 {
         // single video: plain download
-        runner.run_ytdlp(item_id, url, dl_dir, quality)?;
+        runner.run_ytdlp(item_id, url, dl_dir, quality, parts)?;
     } else {
-        // multi-part / playlist: download all parts (no merge)
-        runner.ytdlp_download_playlist(item_id, url, dl_dir, quality)?;
+        // multi-part / playlist: download the (selected) parts (no merge)
+        runner.ytdlp_download_playlist(item_id, url, dl_dir, quality, parts)?;
     }
 
     // collect media files, sorted by name so p01 < p02 < ... (playlist_index prefix is zero-padded in the -o template)
@@ -1048,14 +1090,14 @@ fn download_from_url(
         return Err("yt-dlp finished but no media file found in download dir".to_string());
     }
 
+    let merged_name = if title.trim().is_empty() {
+        "video".to_string()
+    } else {
+        sanitize_filename(title)
+    };
     if files.len() == 1 {
         // rename the single file to a clean <title>.mp4 inside the title dir
         let src = &files[0];
-        let merged_name = if title.trim().is_empty() {
-            "video".to_string()
-        } else {
-            sanitize_filename(title)
-        };
         let dest = dl_dir.join(format!("{merged_name}.mp4"));
         if src != &dest {
             let _ = std::fs::copy(src, &dest);
@@ -1072,6 +1114,14 @@ fn download_from_url(
             return Ok(vec![dest]);
         }
         return Ok(vec![src.clone()]);
+    }
+
+    // user chose to merge the selected parts: concatenate them in playlist
+    // order into one file and analyze that single video
+    if parts.is_some_and(|p| p.len() > 1) {
+        let dest = dl_dir.join(format!("{merged_name}.mp4"));
+        runner.merge_videos(item_id, &files, &dest)?;
+        return Ok(vec![dest]);
     }
 
     // multi-part: keep every part in order (p01 < p02 < ...)
@@ -1137,6 +1187,29 @@ pub fn probe_ytdlp_titles(url: &str, cookie_browser: &str) -> Result<Vec<String>
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty())
         .collect())
+}
+
+/// Structured probe for the multi-part picker: the URL's main title plus its
+/// parts as `(1-based page, part title)` in playlist order.
+pub fn probe_url_parts(
+    url: &str,
+    cookie_browser: &str,
+) -> Result<(String, Vec<(u32, String)>), String> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let on_progress = Arc::new(Mutex::new(Box::new(|_: u8| {}) as Box<dyn FnMut(u8) + Send>));
+    let on_log = Arc::new(Mutex::new(
+        Box::new(|_: String| {}) as Box<dyn FnMut(String) + Send>
+    ));
+    let cookies = if cookie_browser.trim().is_empty() {
+        None
+    } else {
+        Some(Arc::new(crate::cookies::load_browser_cookies(
+            cookie_browser,
+            &|_: &str| {},
+        )?))
+    };
+    let dl = crate::downloader::Downloader::new(cancel, on_progress, on_log, cookies);
+    dl.probe_parts(url)
 }
 
 /// Make a string safe to use as a Windows file name.
@@ -1537,15 +1610,39 @@ pub fn run_item(
     let (videos, video_title, title_dir) = if let Some(url) = &item.url {
         // Probe the titles up front so we know the dir name before downloading.
         let titles = runner.ytdlp_list_titles(&id, url)?;
-        let title = titles
-            .first()
-            .map(|t| simplify_title_str(t))
-            .filter(|t| !t.trim().is_empty())
-            .unwrap_or_else(|| "video".to_string());
+        // Title for the results dir: a single selected part keeps its
+        // "main p0N part" title (unsimplified) so separate per-part tasks do
+        // not collide in results/<main title>/; everything else uses the
+        // simplified main title.
+        let title = match item.parts.as_deref() {
+            Some([k]) => titles
+                .get((*k as usize).saturating_sub(1))
+                .cloned()
+                .filter(|t| !t.trim().is_empty())
+                .unwrap_or_else(|| {
+                    titles
+                        .first()
+                        .map(|t| simplify_title_str(t))
+                        .unwrap_or_else(|| "video".to_string())
+                }),
+            _ => titles
+                .first()
+                .map(|t| simplify_title_str(t))
+                .filter(|t| !t.trim().is_empty())
+                .unwrap_or_else(|| "video".to_string()),
+        };
         let dir = sanitize_filename(&title);
         let tdir = results_dir.join(&dir);
         std::fs::create_dir_all(&tdir).map_err(|e| format!("create title dir: {e}"))?;
-        let paths = download_from_url(runner, &id, url, &tdir, config.download_quality, &title)?;
+        let paths = download_from_url(
+            runner,
+            &id,
+            url,
+            &tdir,
+            config.download_quality,
+            &title,
+            item.parts.as_deref(),
+        )?;
         (paths, title, tdir)
     } else if let Some(p) = &item.local_path {
         let pb = PathBuf::from(p);

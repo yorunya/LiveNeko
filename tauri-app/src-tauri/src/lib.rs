@@ -114,6 +114,7 @@ pub fn run() {
             commands::get_setup_status,
             commands::get_queue,
             commands::add_url,
+            commands::list_url_videos,
             commands::add_local_file,
             commands::remove_item,
             commands::clear_queue,

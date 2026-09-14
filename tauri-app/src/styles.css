@@ -399,3 +399,43 @@ button:focus-visible, summary:focus-visible { outline: 2px solid var(--primary);
 }
 .step-body { flex: 1; }
 .step-body input { margin: 4px 0; }
+
+/* Multi-part video picker */
+.parts-toolbar {
+  display: flex;
+  gap: 8px;
+  margin: 10px 0 6px;
+}
+.parts-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 40vh;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px;
+}
+.parts-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.parts-row:hover { background: var(--bg); }
+.parts-row input { flex-shrink: 0; }
+.parts-idx {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  min-width: 36px;
+  flex-shrink: 0;
+}
+.parts-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.parts-options { margin: 14px 0; display: flex; flex-direction: column; gap: 6px; }
+.parts-options .check { display: flex; gap: 10px; align-items: flex-start; }

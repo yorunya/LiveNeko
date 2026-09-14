@@ -2,6 +2,7 @@ use crate::assets::Assets;
 use crate::config::AppConfig;
 use crate::model_ipc::log_line;
 use crate::pipeline::{self, hide_console, ItemStatus, PipelineHandle, QueueItem, Runner};
+use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -685,28 +686,77 @@ pub async fn add_url(
     state: State<'_, AppState>,
     url: String,
     title: Option<String>,
+    parts: Option<Vec<u32>>,
 ) -> Result<QueueItem, String> {
     if !url.starts_with("http") {
         return Err("URL must start with http:// or https://".to_string());
     }
+    // Selected anthology pages (None/empty = all parts). More than one page
+    // means the user chose to merge those parts into one video.
+    let selected = parts.filter(|p| !p.is_empty());
     // Use the caller-provided title, otherwise probe the real video title in-process so the queue shows it instead of a placeholder.
+    // A single selected part shows its own "main p0N part" title so separate
+    // per-part tasks are distinguishable in the queue.
+    let cookie_browser = state.config.lock().unwrap().cookie_browser.clone();
     let title = match title {
         Some(t) if !t.trim().is_empty() => t,
         _ => {
-            let cookie_browser = state.config.lock().unwrap().cookie_browser.clone();
-            match crate::pipeline::probe_ytdlp_titles(&url, &cookie_browser) {
-                Ok(titles) => titles
-                    .first()
-                    .map(|t| crate::pipeline::simplify_title_str(t))
-                    .unwrap_or_else(|| "Bilibili video".to_string()),
-                Err(_) => "Bilibili video".to_string(),
+            let titles = crate::pipeline::probe_ytdlp_titles(&url, &cookie_browser).ok();
+            let main = titles
+                .as_ref()
+                .and_then(|ts| ts.first())
+                .map(|t| crate::pipeline::simplify_title_str(t));
+            let fallback = "Bilibili video".to_string();
+            match selected.as_deref() {
+                Some([k]) => titles
+                    .as_ref()
+                    .and_then(|ts| ts.get((*k as usize).saturating_sub(1)))
+                    .cloned()
+                    .filter(|t| !t.trim().is_empty())
+                    .or(main)
+                    .unwrap_or(fallback),
+                _ => main.unwrap_or(fallback),
             }
         }
     };
     let id = Uuid::new_v4().simple().to_string();
-    let item = QueueItem::from_url(id, title, url);
+    let mut item = QueueItem::from_url(id, title, url);
+    item.parts = selected;
     state.queue.lock().unwrap().push(item.clone());
     Ok(item)
+}
+
+/// Structured probe for the multi-part picker: the URL's main title and its
+/// parts (1-based page + part title) in playlist order.
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct UrlPartInfo {
+    pub index: u32,
+    pub title: String,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct UrlVideoInfo {
+    pub title: String,
+    pub parts: Vec<UrlPartInfo>,
+}
+
+#[tauri::command]
+pub async fn list_url_videos(
+    state: State<'_, AppState>,
+    url: String,
+) -> Result<UrlVideoInfo, String> {
+    if !url.starts_with("http") {
+        return Err("URL must start with http:// or https://".to_string());
+    }
+    let cookie_browser = state.config.lock().unwrap().cookie_browser.clone();
+    let (title, parts) = crate::pipeline::probe_url_parts(&url, &cookie_browser)?;
+    let parts = parts
+        .into_iter()
+        .map(|(index, title)| UrlPartInfo { index, title })
+        .collect();
+    Ok(UrlVideoInfo { title, parts })
 }
 
 #[tauri::command]

@@ -52,6 +52,9 @@ pub struct AppConfig {
     pub asr_model_dir: String,
     /// Optional ASR language hint ("" = model default; en/zh/auto/...).
     pub asr_language: String,
+    /// Maximum number of ASR requests the audio worker processes
+    /// simultaneously (1 = sequential, the historical behavior).
+    pub asr_concurrency: u32,
     /// SPK model is optional: when disabled (or missing) speaker identification
     /// is disabled and every utterance is labelled "other".
     pub spk_enabled: bool,
@@ -147,6 +150,7 @@ impl AppConfig {
             asr_model_id: default_model_id("sensevoice-small", "huggingface"),
             asr_model_dir: String::new(),
             asr_language: String::new(),
+            asr_concurrency: 5,
             spk_enabled: false,
             spk_source: "huggingface".to_string(),
             spk_model_id: default_model_id("cam++", "huggingface"),
@@ -280,6 +284,12 @@ impl AppConfig {
         self.asr_model_dir = self.asr_model_dir.trim().to_string();
         self.spk_model_dir = self.spk_model_dir.trim().to_string();
         self.asr_language = self.asr_language.trim().to_string();
+        // ASR concurrency: 0 = the key was absent (older config.json) and
+        // means the default; otherwise clamp to a sane worker range.
+        if self.asr_concurrency == 0 {
+            self.asr_concurrency = 5;
+        }
+        self.asr_concurrency = self.asr_concurrency.clamp(1, 32);
         self.funasr_models_dir = self.funasr_models_dir.trim().to_string();
         if self.qwen3_base_url.trim().is_empty() {
             self.qwen3_base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1".to_string();

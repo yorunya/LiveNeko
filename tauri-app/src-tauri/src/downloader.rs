@@ -156,8 +156,7 @@ impl HttpClient {
         if start >= total {
             // Part already complete from a previous run.
             let _ = std::fs::remove_file(dest);
-            std::fs::rename(&part, dest)
-                .map_err(|e| format!("move part -> dest: {e}"))?;
+            finalize_part(&part, dest)?;
             report(&on_progress, 100);
             return Ok(());
         }
@@ -205,8 +204,7 @@ impl HttpClient {
         }
         drop(file);
         let _ = std::fs::remove_file(dest);
-        std::fs::rename(&part, dest)
-            .map_err(|e| format!("move part -> dest: {e}"))?;
+        finalize_part(&part, dest)?;
         report(&on_progress, 100);
         Ok(())
     }
@@ -377,7 +375,7 @@ impl HttpClient {
             }
         }?;
         let _ = std::fs::remove_file(dest);
-        std::fs::rename(part, dest).map_err(|e| format!("move part -> dest: {e}"))?;
+        finalize_part(part, dest)?;
         report(on_progress, 100);
         Ok(())
     }
@@ -604,18 +602,47 @@ impl Downloader {
         }
     }
 
+    /// Structured variant of `probe_titles` for the multi-part picker: returns
+    /// the video's main title and its parts as `(1-based page, part title)`
+    /// pairs in playlist order. YouTube URLs always yield a single part; a
+    /// Bilibili `?p=N` URL yields only that page (the picker stays closed and
+    /// the legacy single-page download path runs).
+    pub fn probe_parts(&self, url: &str) -> Result<(String, Vec<(u32, String)>), String> {
+        if url.contains("bilibili.com") {
+            let meta = self.bilibili_meta(url)?;
+            let part_id = query_param(url, "p").and_then(|v| v.parse::<u32>().ok());
+            let parts = meta
+                .pages
+                .iter()
+                .filter(|(p, _, _)| part_id.is_none_or(|pid| *p == pid))
+                .map(|(page, _, part)| (*page, part.clone()))
+                .collect();
+            Ok((meta.title, parts))
+        } else if url.contains("youtube.com") || url.contains("youtu.be") {
+            let titles = self.youtube_probe_titles(url)?;
+            let title = titles.into_iter().next().unwrap_or_else(|| "video".into());
+            Ok((title.clone(), vec![(1, title)]))
+        } else {
+            Err("unsupported URL (only Bilibili and YouTube are supported)".into())
+        }
+    }
+
     /// Download a single video (or all parts of an anthology) into `out_dir`.
     /// `quality` is the maximum height (360/480/720/1080).
+    /// `parts` selects specific anthology pages (1-based, yt-dlp
+    /// `--playlist-items` equivalent): None = all parts, and the selection is
+    /// applied in playlist order regardless of the order given.
     /// Returns the list of downloaded media files in order.
     pub fn download(
         &self,
         url: &str,
         out_dir: &Path,
         quality: u32,
+        parts: Option<&[u32]>,
     ) -> Result<Vec<PathBuf>, String> {
         std::fs::create_dir_all(out_dir).map_err(|e| format!("create dir: {e}"))?;
         if url.contains("bilibili.com") {
-            self.bilibili_download(url, out_dir, quality)
+            self.bilibili_download(url, out_dir, quality, parts)
         } else if url.contains("youtube.com") || url.contains("youtu.be") {
             self.youtube_download(url, out_dir, quality)
         } else {
@@ -646,13 +673,14 @@ impl Downloader {
         url: &str,
         out_dir: &Path,
         quality: u32,
+        parts: Option<&[u32]>,
     ) -> Result<Vec<PathBuf>, String> {
         self.log(format!("[downloader] downloading {url}"));
         let meta = self.bilibili_meta(url)?;
 
         // If a specific ?p= is requested, keep only that page.
         let part_id = query_param(url, "p").and_then(|v| v.parse::<u32>().ok());
-        let selected: Vec<(u32, u64, String)> = if let Some(pid) = part_id {
+        let mut selected: Vec<(u32, u64, String)> = if let Some(pid) = part_id {
             meta.pages
                 .iter()
                 .filter(|(p, _, _)| *p == pid)
@@ -661,6 +689,16 @@ impl Downloader {
         } else {
             meta.pages.clone()
         };
+        // --playlist-items equivalent: keep only the requested pages, in
+        // playlist order; requested pages that no longer exist are skipped
+        // with a log line like yt-dlp's missing-entry warning.
+        if let Some(want) = parts.filter(|w| !w.is_empty()) {
+            let (keep, missing) = filter_pages_by_parts(&selected, want);
+            for p in &missing {
+                self.log(format!("[downloader] page p{p} not found, skipping"));
+            }
+            selected = keep;
+        }
         if selected.is_empty() {
             return Err(format!("no video page p{} found", part_id.unwrap_or(0)));
         }
@@ -668,6 +706,7 @@ impl Downloader {
         self.log(format!("URL yields {} video(s)", selected.len()));
 
         let mut files = Vec::new();
+        let total = selected.len() as u32;
         for (idx, (_page, cid, part_title)) in selected.iter().enumerate() {
             if self.cancel.load(Ordering::SeqCst) {
                 return Err("cancelled".into());
@@ -683,8 +722,19 @@ impl Downloader {
             } else {
                 format!("{} [{}].mp4", sanitize_filename(&meta.title), meta.bvid)
             };
+            // Per-part 0..100 maps onto the overall download so a multi-part
+            // URL advances monotonically: part k spans ((k-1)*100/n, k*100/n]
+            // and the last part ends at exactly 100.
+            let part_progress = Arc::new(Mutex::new(Box::new({
+                let on_progress = self.on_progress.clone();
+                move |p: u8| {
+                    let overall = ((idx as u32 * 100 + p as u32) / total).min(100) as u8;
+                    let mut f = on_progress.lock().unwrap();
+                    (f)(overall);
+                }
+            }) as Box<dyn FnMut(u8) + Send>));
             let dest = out_dir.join(filename);
-            self.bilibili_download_playinfo(&play_info, &dest, url, quality)?;
+            self.bilibili_download_playinfo(&play_info, &dest, url, quality, &part_progress)?;
             files.push(dest);
         }
         Ok(files)
@@ -1030,7 +1080,12 @@ impl Downloader {
         dest: &Path,
         referer: &str,
         quality: u32,
+        on_progress: &ProgressCb,
     ) -> Result<(), String> {
+        let report = |p: u8| {
+            let mut f = on_progress.lock().unwrap();
+            (f)(p);
+        };
         // CDN request headers: yt-dlp downloads DASH media with
         // `http_headers: {'Referer': url}` (+ cookies for matching domains).
         let cdn_headers = |media_url: &str| -> Vec<(&'static str, String)> {
@@ -1108,7 +1163,7 @@ impl Downloader {
 
             // Video (50% of progress), audio (next 30%), merge (last 20%).
             let video_progress = Arc::new(Mutex::new(Box::new({
-                let on_progress = self.on_progress.clone();
+                let on_progress = on_progress.clone();
                 move |p: u8| {
                     let mut f = on_progress.lock().unwrap();
                     (f)(p / 2);
@@ -1127,7 +1182,7 @@ impl Downloader {
                 let a_headers_ref: Vec<(&str, &str)> =
                     a_headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
                 let audio_progress = Arc::new(Mutex::new(Box::new({
-                    let on_progress = self.on_progress.clone();
+                    let on_progress = on_progress.clone();
                     move |p: u8| {
                         let mut f = on_progress.lock().unwrap();
                         (f)(50 + p * 3 / 10);
@@ -1142,9 +1197,9 @@ impl Downloader {
                 )?;
             }
 
-            self.progress(80);
+            report(80);
             self.merge_av(&tmp_video, tmp_audio.exists().then_some(tmp_audio.clone()), dest)?;
-            self.progress(100);
+            report(100);
             return Ok(());
         }
 
@@ -1178,9 +1233,9 @@ impl Downloader {
             dest,
             &headers_ref,
             &self.cancel,
-            self.on_progress.clone(),
+            on_progress.clone(),
         )?;
-        self.progress(100);
+        report(100);
         Ok(())
     }
 
@@ -1209,6 +1264,56 @@ impl Downloader {
                 "ffmpeg merge failed: {}",
                 String::from_utf8_lossy(&out.stderr).trim()
             ));
+        }
+        Ok(())
+    }
+
+    /// Concatenate several already-downloaded videos into one file with the
+    /// same stream-copy merge `merge_av` uses: ffmpeg's concat demuxer with
+    /// `-c copy -movflags +faststart` (no re-encode; the parts of one
+    /// anthology share codecs/parameters). Inputs and the temp list file are
+    /// removed on success. A single input is moved onto `dest` directly.
+    pub fn merge_videos(&self, files: &[PathBuf], dest: &Path) -> Result<(), String> {
+        if files.is_empty() {
+            return Err("merge: no input files".into());
+        }
+        if files.len() == 1 {
+            std::fs::rename(&files[0], dest).map_err(|e| format!("move part -> dest: {e}"))?;
+            return Ok(());
+        }
+        let list = dest.with_extension("concat.txt");
+        let mut text = String::new();
+        for f in files {
+            // concat-demuxer quoting: wrap in single quotes, escape inner ones
+            let quoted = f.display().to_string().replace('\'', "'\\''");
+            text.push_str(&format!("file '{quoted}'\n"));
+        }
+        std::fs::write(&list, text).map_err(|e| format!("write concat list: {e}"))?;
+        let mut cmd = std::process::Command::new(&self.ffmpeg);
+        cmd.arg("-y")
+            .arg("-f")
+            .arg("concat")
+            .arg("-safe")
+            .arg("0")
+            .arg("-i")
+            .arg(&list)
+            .arg("-c")
+            .arg("copy")
+            .arg("-movflags")
+            .arg("+faststart")
+            .arg(dest);
+        crate::pipeline::hide_console(&mut cmd);
+        let out = cmd.output().map_err(|e| format!("ffmpeg: {e}"))?;
+        let _ = std::fs::remove_file(&list);
+        if !out.status.success() {
+            let _ = std::fs::remove_file(dest);
+            return Err(format!(
+                "ffmpeg concat failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        for f in files {
+            let _ = std::fs::remove_file(f);
         }
         Ok(())
     }
@@ -1531,6 +1636,39 @@ fn part_path(url: &str) -> PathBuf {
     std::env::temp_dir().join(format!("liveneko_dl_{h:016x}.part"))
 }
 
+/// Move a finished `.part` file onto its destination. The part file lives in
+/// the temp dir while `dest` lives in the data dir; when the two sit on
+/// different drives (data dir moved off the system drive) `rename` fails with
+/// ERROR_NOT_SAME_DEVICE (os error 17), so fall back to copy+delete.
+fn finalize_part(part: &Path, dest: &Path) -> Result<(), String> {
+    if std::fs::rename(part, dest).is_ok() {
+        return Ok(());
+    }
+    std::fs::copy(part, dest).map_err(|e| format!("move part -> dest: {e}"))?;
+    std::fs::remove_file(part).map_err(|e| format!("move part -> dest: {e}"))
+}
+
+/// Apply a `--playlist-items`-style page selection to an anthology's page
+/// list: keeps only the requested pages **in playlist order** (yt-dlp yields
+/// entries in playlist order regardless of the order requested) and returns
+/// the requested pages that do not exist so the caller can log them.
+fn filter_pages_by_parts(
+    pages: &[(u32, u64, String)],
+    want: &[u32],
+) -> (Vec<(u32, u64, String)>, Vec<u32>) {
+    let keep: Vec<(u32, u64, String)> = pages
+        .iter()
+        .filter(|(p, _, _)| want.contains(p))
+        .cloned()
+        .collect();
+    let missing: Vec<u32> = want
+        .iter()
+        .filter(|w| !pages.iter().any(|(p, _, _)| p == *w))
+        .copied()
+        .collect();
+    (keep, missing)
+}
+
 /// Host portion of a URL (no scheme, no path).
 fn host_of(url: &str) -> &str {
     let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
@@ -1777,6 +1915,29 @@ mod tests {
     }
 
     #[test]
+    fn test_filter_pages_by_parts() {
+        let pages = |ps: &[(u32, &str)]| -> Vec<(u32, u64, String)> {
+            ps.iter().map(|(p, t)| (*p, 100 + *p as u64, t.to_string())).collect()
+        };
+        let all = pages(&[(1, "a"), (2, "b"), (3, "c"), (4, "d")]);
+
+        // subset selection comes back in playlist order, not request order
+        let (keep, missing) = filter_pages_by_parts(&all, &[3, 1]);
+        assert_eq!(keep, pages(&[(1, "a"), (3, "c")]));
+        assert!(missing.is_empty());
+
+        // requested pages that do not exist are reported, the rest kept
+        let (keep, missing) = filter_pages_by_parts(&all, &[2, 9]);
+        assert_eq!(keep, pages(&[(2, "b")]));
+        assert_eq!(missing, vec![9]);
+
+        // duplicates in the request must not duplicate downloads
+        let (keep, missing) = filter_pages_by_parts(&all, &[2, 2]);
+        assert_eq!(keep, pages(&[(2, "b")]));
+        assert!(missing.is_empty());
+    }
+
+    #[test]
     fn test_sha1_hex() {
         // sha1("abc") from FIPS 180-1 test vectors
         assert_eq!(sha1_hex("abc"), "a9993e364706816aba3e25717850c26c9cd0d89d");
@@ -1847,7 +2008,7 @@ mod tests {
         let url = std::env::var("BILI_TEST_URL")
             .unwrap_or_else(|_| "https://www.bilibili.com/video/BV1E7uU6tEPA".into());
         let dir = std::env::temp_dir().join("liveneko_bili_test");
-        let files = d.download(&url, &dir, 720).unwrap();
+        let files = d.download(&url, &dir, 720, None).unwrap();
         eprintln!("bilibili files: {files:?}");
         assert!(!files.is_empty());
         assert!(files[0].exists());
